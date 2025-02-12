@@ -815,4 +815,8 @@ void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl)
         hl_decode_mb_simple_16(h, sl);
     } else
         hl_decode_mb_simple_8(h, sl);
+
+    // videoparser
+    // Note: Currently treating all QPs as non-border for H.264
+    videoparser_shared_frame_info_update_qp(h->cur_pic_ptr->f, sl->qscale);
 }

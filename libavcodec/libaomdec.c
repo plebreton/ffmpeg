@@ -215,6 +215,11 @@ static int aom_decode(AVCodecContext *avctx, AVFrame *picture,
         return AVERROR_INVALIDDATA;
     }
 
+    // videoparser
+    int qp;
+    aom_codec_control(&ctx->decoder, AOMD_GET_LAST_QUANTIZER, &qp);
+    videoparser_shared_frame_info_update_qp(picture, qp);
+
     if ((img = aom_codec_get_frame(&ctx->decoder, &iter))) {
         if (img->d_w > img->w || img->d_h > img->h) {
             av_log(avctx, AV_LOG_ERROR, "Display dimensions %dx%d exceed storage %dx%d\n",

@@ -28,6 +28,122 @@
 #include "side_data.h"
 #include "hwcontext.h"
 
+// videoparser: POC-based motion vector normalization flag
+// When enabled, replicates legacy parser behavior for compatibility
+#ifndef VP_MV_POC_NORMALIZATION
+#define VP_MV_POC_NORMALIZATION 0
+#endif
+
+// videoparser
+#define SQR(_x_) (_x_) * (_x_)
+
+/**
+ * @brief Initialize the shared frame info for the videoparser, or return the existing one.
+ *
+ * @param frame The frame to initialize the shared frame info for.
+ * @return SharedFrameInfo* pointer to the shared frame info or NULL if error
+ */
+static SharedFrameInfo *videoparer_init_shared_frame_info(AVFrame *frame) {
+    SharedFrameInfo *sf;
+    AVFrameSideData *side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
+    if (side_data) {
+        return (SharedFrameInfo *)side_data->data;
+    }
+
+    // init new side data
+    side_data = av_frame_new_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO, sizeof(SharedFrameInfo));
+    if (!side_data) {
+        // should not happen
+        return NULL;
+    }
+    sf = (SharedFrameInfo *)side_data->data;
+
+    sf->frame_idx = -1;
+    sf->qp_sum = 0;
+    sf->qp_sum_sqr = 0;
+    sf->qp_cnt = 0;
+    sf->qp_sum_bb = 0;
+    sf->qp_sum_sqr_bb = 0;
+    sf->qp_cnt_bb = 0;
+    sf->qp_min = UINT32_MAX;
+    sf->qp_max = 0;
+    sf->qp_init = 0;
+    sf->qp_avg = 0;
+    sf->qp_stdev = 0;
+    sf->qp_bb_avg = 0;
+    sf->qp_bb_stdev = 0;
+
+    // TODO: add other fields as needed
+
+    return sf;
+}
+
+void videoparser_shared_frame_info_update_qp(AVFrame *frame, uint32_t qp) {
+    SharedFrameInfo *sf = videoparer_init_shared_frame_info(frame);
+    if (!sf) {
+        return;
+    }
+
+    // Update initial QP if this is the first one
+    if (sf->qp_cnt == 0) {
+        sf->qp_init = qp;
+    }
+
+    // Update min/max
+    sf->qp_min = FFMIN(sf->qp_min, qp);
+    sf->qp_max = FFMAX(sf->qp_max, qp);
+
+    // Update overall stats
+    sf->qp_sum += qp;
+    sf->qp_sum_sqr += qp * qp;
+    sf->qp_cnt++;
+
+    // if (sf->qp_cnt == 1) {
+    //     // log once
+    //     printf("Updating QP for frame PTS %lld with QP %d, overall count: %d\n", frame->pts, qp, sf->qp_cnt);
+    // }
+
+    // TODO define black border stats, right now they are equal to the overall stats
+    sf->qp_sum_bb += qp;
+    sf->qp_sum_sqr_bb += qp * qp;
+    sf->qp_cnt_bb++;
+}
+
+
+/**
+ * videoparser
+ * @brief Get the Shared Frame Info object, with some calculations applied
+ * before returning it to the videoparser.
+ *
+ * @param frame The frame to get the shared frame info from.
+ * @return SharedFrameInfo*
+ */
+SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame) {
+    // get side-data from frame
+    SharedFrameInfo *sf;
+    AVFrameSideData *side_data =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
+    if (!side_data) {
+        // FIXME: why would this happen?
+        return NULL;
+    }
+
+    sf = (SharedFrameInfo *)side_data->data;
+
+    // should not happen, but we need to check to avoid division by zero
+    if (sf->qp_cnt == 0) {
+        return sf;
+    }
+
+    // calculate final QP statistics from internal fields
+    sf->qp_avg = sf->qp_sum / sf->qp_cnt;
+    sf->qp_stdev = sqrt(sf->qp_sum_sqr / sf->qp_cnt - sf->qp_avg * sf->qp_avg);
+    sf->qp_bb_avg = sf->qp_sum_bb / sf->qp_cnt_bb;
+    sf->qp_bb_stdev = sqrt(sf->qp_sum_sqr_bb / sf->qp_cnt_bb - sf->qp_bb_avg * sf->qp_bb_avg);
+
+    return sf;
+}
+
 static void get_frame_defaults(AVFrame *frame)
 {
     memset(frame, 0, sizeof(*frame));

@@ -2593,6 +2593,9 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
         x += min_cb_width;
     }
 
+    // videoparser
+    videoparser_shared_frame_info_update_qp(s->cur_frame->f, lc->qp_y);
+
     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
         lc->qPy_pred = lc->qp_y;
