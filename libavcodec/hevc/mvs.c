@@ -492,6 +492,8 @@ void ff_hevc_luma_mv_merge_mode(HEVCLocalContext *lc, const HEVCPPS *pps,
     int nPbW2 = nPbW;
     int nPbH2 = nPbH;
 
+    memset(mergecand_list, 0, sizeof(MvField) * MRG_MAX_NUM_CANDS); // videoparser
+
     if (pps->log2_parallel_merge_level > 2 && nCS == 8) {
         singleMCLFlag = 1;
         x0            = lc->cu.x;

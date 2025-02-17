@@ -37,18 +37,23 @@
 // videoparser
 #define SQR(_x_) (_x_) * (_x_)
 
+// videoparser
+#define SQR(_x_) (_x_) * (_x_)
+
 /**
  * @brief Initialize the shared frame info for the videoparser, or return the existing one.
  *
  * @param frame The frame to initialize the shared frame info for.
  * @return SharedFrameInfo* pointer to the shared frame info or NULL if error
  */
-static SharedFrameInfo *videoparer_init_shared_frame_info(AVFrame *frame) {
+static SharedFrameInfo *videoparser_init_shared_frame_info(AVFrame *frame) {
     SharedFrameInfo *sf;
-    AVFrameSideData *side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
-    if (side_data) {
-        return (SharedFrameInfo *)side_data->data;
-    }
+    AVFrameSideData *side_data;
+
+    // side_data = (frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
+    // if (side_data) {
+    //     return (SharedFrameInfo *)side_data->data;
+    // }
 
     // init new side data
     side_data = av_frame_new_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO, sizeof(SharedFrameInfo));
@@ -59,6 +64,8 @@ static SharedFrameInfo *videoparer_init_shared_frame_info(AVFrame *frame) {
     sf = (SharedFrameInfo *)side_data->data;
 
     sf->frame_idx = -1;
+
+    // QP values
     sf->qp_sum = 0;
     sf->qp_sum_sqr = 0;
     sf->qp_cnt = 0;
@@ -73,16 +80,33 @@ static SharedFrameInfo *videoparer_init_shared_frame_info(AVFrame *frame) {
     sf->qp_bb_avg = 0;
     sf->qp_bb_stdev = 0;
 
-    // TODO: add other fields as needed
+    // motion estimation
+    sf->mv_length = 0;
+    sf->mv_sum_sqr = 0;
+    sf->mv_x_length = 0;
+    sf->mv_y_length = 0;
+    sf->mv_x_sum_sqr = 0;
+    sf->mv_y_sum_sqr = 0;
+    sf->motion_avg = 0;
+    sf->motion_stdev = 0;
+    sf->motion_x_avg = 0;
+    sf->motion_x_stdev = 0;
+    sf->motion_y_avg = 0;
+    sf->motion_y_stdev = 0;
+    sf->motion_diff_avg = 0;
+    sf->motion_diff_stdev = 0;
+    sf->current_poc = 0;
+    sf->poc_diff = 0;
+    sf->motion_bit_count = 0;
+    sf->coefs_bit_count = 0;
+    sf->mb_mv_count = 0;
+    sf->mv_coded_count = 0;
 
     return sf;
 }
 
 void videoparser_shared_frame_info_update_qp(AVFrame *frame, uint32_t qp) {
-    SharedFrameInfo *sf = videoparer_init_shared_frame_info(frame);
-    if (!sf) {
-        return;
-    }
+    SharedFrameInfo *sf = videoparser_get_shared_frame_info(frame);
 
     // Update initial QP if this is the first one
     if (sf->qp_cnt == 0) {
@@ -98,17 +122,33 @@ void videoparser_shared_frame_info_update_qp(AVFrame *frame, uint32_t qp) {
     sf->qp_sum_sqr += qp * qp;
     sf->qp_cnt++;
 
-    // if (sf->qp_cnt == 1) {
-    //     // log once
-    //     printf("Updating QP for frame PTS %lld with QP %d, overall count: %d\n", frame->pts, qp, sf->qp_cnt);
-    // }
-
     // TODO define black border stats, right now they are equal to the overall stats
     sf->qp_sum_bb += qp;
     sf->qp_sum_sqr_bb += qp * qp;
     sf->qp_cnt_bb++;
 }
 
+/**
+ * videoparser
+ * @brief Get the Shared Frame Info object, with no other calculations applied.
+ *
+ * @param frame The frame to get the shared frame info from.
+ * @return SharedFrameInfo*
+ */
+SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame) {
+    AVFrameSideData *side_data;
+
+    if (!frame) {
+        return NULL;
+    }
+
+    side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
+    if (!side_data) {
+        return videoparser_init_shared_frame_info(frame);
+    }
+
+    return (SharedFrameInfo *)side_data->data;
+}
 
 /**
  * videoparser
@@ -118,15 +158,28 @@ void videoparser_shared_frame_info_update_qp(AVFrame *frame, uint32_t qp) {
  * @param frame The frame to get the shared frame info from.
  * @return SharedFrameInfo*
  */
-SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame) {
+SharedFrameInfo *videoparser_get_final_shared_frame_info(AVFrame *frame) {
     // get side-data from frame
     SharedFrameInfo *sf;
-    AVFrameSideData *side_data =
-        av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
+    int num_motion, num_diffs, frame_type;
+    AVFrameSideData *side_data;
+    side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_INFO);
     if (!side_data) {
         // FIXME: why would this happen?
         return NULL;
     }
+
+    // FIXME: this is how we get the motion vectors after they have been written to the side data
+    // by ffmpeg itself, but it is only available for H.264 at the moment.
+    // AVFrameSideData *motion_vectors =
+    //     av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
+    // if (motion_vectors) {
+    //   const AVMotionVector *mvs = (const AVMotionVector *)motion_vectors->data;
+    //   for (int i = 0; i < motion_vectors->size / sizeof(*mvs); i++) {
+    //     const AVMotionVector *mv = &mvs[i];
+    //     // TODO: use these for the calculation
+    //   }
+    // }
 
     sf = (SharedFrameInfo *)side_data->data;
 
@@ -140,6 +193,28 @@ SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame) {
     sf->qp_stdev = sqrt(sf->qp_sum_sqr / sf->qp_cnt - sf->qp_avg * sf->qp_avg);
     sf->qp_bb_avg = sf->qp_sum_bb / sf->qp_cnt_bb;
     sf->qp_bb_stdev = sqrt(sf->qp_sum_sqr_bb / sf->qp_cnt_bb - sf->qp_bb_avg * sf->qp_bb_avg);
+
+    // calculate motion vector statistics
+    frame_type = frame->pict_type;
+    if (frame_type != AV_PICTURE_TYPE_I) {
+      num_motion = sf->mb_mv_count;
+      num_diffs = num_motion;
+
+      if (num_motion > 0) {
+        sf->motion_avg = sf->mv_length / num_motion;
+        sf->motion_diff_avg = sf->mv_length_diff / num_diffs;
+        sf->motion_x_avg = sf->mv_x_length / num_motion;
+        sf->motion_y_avg = sf->mv_y_length / num_motion;
+        sf->motion_x_stdev = sqrt(0.00001 + sf->mv_x_sum_sqr / num_motion -
+                                 SQR(sf->mv_x_length / num_motion));
+        sf->motion_y_stdev = sqrt(0.00001 + sf->mv_y_sum_sqr / num_motion -
+                                 SQR(sf->mv_y_length / num_motion));
+        sf->motion_stdev = sqrt(0.00001 + sf->mv_sum_sqr / num_motion -
+                               SQR(sf->mv_length / num_motion));
+        sf->motion_diff_stdev = sqrt(0.00001 + sf->mv_diff_sum_sqr / num_diffs -
+                                    SQR(sf->mv_length_diff / num_diffs));
+      }
+    }
 
     return sf;
 }

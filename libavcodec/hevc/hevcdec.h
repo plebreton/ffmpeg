@@ -307,6 +307,7 @@ typedef struct Mv {
 
 typedef struct MvField {
     DECLARE_ALIGNED(4, Mv, mv)[2];
+    DECLARE_ALIGNED(4, Mv, mvd)[2]; // videoparser
     int8_t ref_idx[2];
     int8_t pred_flag;
 } MvField;

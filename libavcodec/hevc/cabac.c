@@ -1492,6 +1492,8 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
 
 void ff_hevc_hls_mvd_coding(HEVCLocalContext *lc, int x0, int y0, int log2_cb_size)
 {
+    SharedFrameInfo *sf;
+
     int x = abs_mvd_greater0_flag_decode(lc);
     int y = abs_mvd_greater0_flag_decode(lc);
 
@@ -1499,6 +1501,10 @@ void ff_hevc_hls_mvd_coding(HEVCLocalContext *lc, int x0, int y0, int log2_cb_si
         x += abs_mvd_greater1_flag_decode(lc);
     if (y)
         y += abs_mvd_greater1_flag_decode(lc);
+
+    // videoparser
+    sf = videoparser_get_shared_frame_info(lc->parent->cur_frame->f);
+    sf->mv_coded_count += (1 << (log2_cb_size - 2)) * (1 << (log2_cb_size - 2));
 
     switch (x) {
     case 2: lc->pu.mvd.x = mvd_decode(lc);           break;

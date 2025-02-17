@@ -131,6 +131,7 @@ static av_always_inline int get_cabac_inline(CABACContext *c, uint8_t * const st
     lps_mask= ff_h264_norm_shift[c->range];
     c->range<<= lps_mask;
     c->low  <<= lps_mask;
+    c->bit_count += lps_mask; // videoparser
     if(!(c->low & CABAC_MASK))
         refill2(c);
     return bit;
@@ -149,6 +150,7 @@ av_unused static int get_cabac(CABACContext *c, uint8_t * const state){
 av_unused static int get_cabac_bypass(CABACContext *c){
     int range;
     c->low += c->low;
+    c->bit_count++; // videoparser
 
     if(!(c->low & CABAC_MASK))
         refill(c);
@@ -167,6 +169,7 @@ av_unused static int get_cabac_bypass(CABACContext *c){
 static av_always_inline int get_cabac_bypass_sign(CABACContext *c, int val){
     int range, mask;
     c->low += c->low;
+    c->bit_count++; // videoparser
 
     if(!(c->low & CABAC_MASK))
         refill(c);

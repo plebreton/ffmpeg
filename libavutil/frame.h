@@ -38,6 +38,7 @@
 #include "version.h"
 
 #include "../../../VideoParser/include/shared.h" // videoparser
+#include "motion_vector.h" // videoparser
 
 /**
  * @defgroup lavu_frame AVFrame
@@ -790,13 +791,21 @@ typedef struct AVFrame {
 } AVFrame;
 
 /**
+ * @brief Get the Shared Frame Info object, with no other calculations applied.
+ *
+ * @param frame The frame to get the shared frame info from.
+ * @return SharedFrameInfo* or NULL if no shared frame info is available.
+ */
+SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame);
+
+/**
  * @brief Get the Shared Frame Info object, with some calculations applied
  * before returning it to the videoparser.
  *
  * @param frame The frame to get the shared frame info from.
- * @return SharedFrameInfo*
+ * @return SharedFrameInfo* or NULL if no shared frame info is available.
  */
-SharedFrameInfo *videoparser_get_shared_frame_info(AVFrame *frame);
+SharedFrameInfo *videoparser_get_final_shared_frame_info(AVFrame *frame);
 
 /**
  * @brief Update the QP statistics for the shared frame info.

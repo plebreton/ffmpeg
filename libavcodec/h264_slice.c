@@ -2563,6 +2563,14 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
     int orig_deblock = sl->deblocking_filter;
     int ret;
 
+    // videoparser
+    static int prev_poc=0, poc_diff=8; // Stores previous Proof of Concept (POC) and an initial expected POC difference
+    static int64_t prev_pts; // Stores previous Presentation Timestamp (PTS)
+    int pts_diff; // Stores calculated difference between current and previous PTS
+    H264Picture *curr_pic;
+    AVFrame *frame;
+    SharedFrameInfo *sf;
+
     sl->linesize   = h->cur_pic_ptr->f->linesize[0];
     sl->uvlinesize = h->cur_pic_ptr->f->linesize[1];
 
@@ -2589,6 +2597,25 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
                 sl->er->error_occurred = 1;
         }
     }
+
+    // videoparser: Tracks POC changes, calculates expected POC differences based on PTS when available, and updates state for the next frame
+    curr_pic = h->cur_pic_ptr;
+    frame = curr_pic->f;
+    sf = videoparser_get_shared_frame_info(frame);
+    sf->current_poc = curr_pic->poc - ((curr_pic->poc > 32768) ? 65536 : 0);
+
+    if (abs(sf->current_poc - prev_poc) != 0) {
+        if ((frame->pts == 0) || (frame->duration == 0)) {
+            poc_diff = FFMIN(poc_diff, abs(sf->current_poc - prev_poc));
+        } else {
+            pts_diff = FFMAX(1, (int)nearbyint(fabs((double)frame->pts - prev_pts) / (double)frame->duration));
+            poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
+        }
+    }
+
+    sf->poc_diff = poc_diff;
+    prev_poc = sf->current_poc;
+    prev_pts = frame->pts;
 
     if (h->ps.pps->cabac) {
         /* realign */

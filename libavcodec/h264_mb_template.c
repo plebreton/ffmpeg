@@ -164,6 +164,13 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
                                       transform_bypass, PIXEL_SHIFT,
                                       block_offset, linesize, dest_y, 0);
 
+            // videoparser: Copy original macroblock data for intra 16x16 analysis
+            if (IS_INTRA16x16(mb_type)) {
+                for (int i = 0; i < 256; i += 16) {
+                    sl->mb0[i] = sl->mb[i];
+                }
+            }
+
             if (sl->deblocking_filter)
                 xchg_mb_border(h, sl, dest_y, dest_cb, dest_cr, linesize,
                                uvlinesize, 0, 0, SIMPLE, PIXEL_SHIFT);

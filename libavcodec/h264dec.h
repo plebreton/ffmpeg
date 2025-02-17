@@ -305,6 +305,7 @@ typedef struct H264SliceContext {
 
     /// as a DCT coefficient is int32_t in high depth, we need to reserve twice the space.
     DECLARE_ALIGNED(16, int16_t, mb)[16 * 48 * 2];
+    DECLARE_ALIGNED(16, int16_t, mb0)[16 * 48 * 2]; // videoparser: Stores DCT coefficients for a reference macroblock (likely used for motion prediction)
     DECLARE_ALIGNED(16, int16_t, mb_luma_dc)[3][16 * 2];
     /// as mb is addressed by scantable[i] and scantable is uint8_t we can either
     /// check that i is not too large or ensure that there is some unused stuff after mb
