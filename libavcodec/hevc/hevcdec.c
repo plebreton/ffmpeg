@@ -1312,6 +1312,7 @@ static int hls_transform_unit(HEVCLocalContext *lc,
 
     // videoparser
     SharedFrameInfo *sf;
+    lc->cc.bit_count = 0;
 
     if (lc->cu.pred_mode == MODE_INTRA) {
         int trafo_size = 1 << log2_trafo_size;
