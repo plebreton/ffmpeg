@@ -28,6 +28,68 @@
 #include "vpx_rac.h"
 #include "vp9shared.h" // videoparser
 #include "libavutil/frame.h" // videoparser
+#include <math.h> // videoparser
+
+// videoparser
+#define SQR(_x_) ((_x_) * (_x_))
+
+/**
+ * Raw motion vector statistics extraction for VP9.
+ * Extracts MV values without any normalization.
+ * Motion vectors are in 1/8 pel units (VP9 uses 1/8 pel precision).
+ *
+ * @param sf SharedFrameInfo to accumulate statistics into
+ * @param mv Motion vector array [0]=L0, [1]=L1
+ * @param comp Whether this is compound (bi-predictive) mode
+ * @param mvd_x MVD x component (only valid for NEWMV mode)
+ * @param mvd_y MVD y component (only valid for NEWMV mode)
+ * @param has_mvd Whether MVD values are valid
+ */
+static void mv_statistics_vp9(SharedFrameInfo *sf, const VP9mv *mv,
+                              int comp, int mvd_x, int mvd_y, int has_mvd) {
+    double mv_x = 0.0, mv_y = 0.0;
+    double mvd_len = 0.0;
+    double mv_length_xy;
+    int dir_cnt = 0;
+
+    // L0 reference (always present for inter blocks)
+    dir_cnt++;
+    mv_x = fabs((double)mv[0].x);
+    mv_y = fabs((double)mv[0].y);
+
+    // L1 reference (compound/bi-predictive)
+    if (comp) {
+        dir_cnt++;
+        mv_x += fabs((double)mv[1].x);
+        mv_y += fabs((double)mv[1].y);
+    }
+
+    // Average across directions for bi-predictive blocks
+    if (dir_cnt > 1) {
+        mv_x /= dir_cnt;
+        mv_y /= dir_cnt;
+    }
+
+    // Calculate magnitude
+    mv_length_xy = sqrt(SQR(mv_x) + SQR(mv_y));
+
+    // For diff stats, use the coded MVD if available (NEWMV mode)
+    if (has_mvd) {
+        mvd_len = sqrt(SQR((double)mvd_x) + SQR((double)mvd_y));
+    }
+
+    // Accumulate statistics
+    sf->mv_length += mv_length_xy;
+    sf->mv_sum_sqr += SQR(mv_length_xy);
+    sf->mv_x_length += mv_x;
+    sf->mv_y_length += mv_y;
+    sf->mv_x_sum_sqr += SQR(mv_x);
+    sf->mv_y_sum_sqr += SQR(mv_y);
+    sf->mv_length_diff += mvd_len;
+    sf->mv_diff_sum_sqr += SQR(mvd_len);
+
+    sf->mb_mv_count++;
+}
 
 static av_always_inline void clamp_mv(VP9mv *dst, const VP9mv *src,
                                       VP9TileData *td)
@@ -296,12 +358,16 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
     VP9Block *b = td->b;
     // videoparser
     SharedFrameInfo *sf = videoparser_get_shared_frame_info(s->s.frames[CUR_FRAME].tf.f);
+    int mvd_x = 0, mvd_y = 0;  // videoparser: track coded MVD
+    int has_mvd = 0;           // videoparser: whether MVD was coded
 
     if (mode == ZEROMV) {
         AV_ZERO32(&mv[0]);
         AV_ZERO32(&mv[1]);
+        // ZEROMV has no motion to track
     } else {
         int hp;
+        int mvd_comp;  // videoparser: temporary for MVD component
 
         // FIXME cache this value and reuse for other subblocks
         find_ref_mvs(td, &mv[0], b->ref[0], 0, mode == NEARMV,
@@ -330,13 +396,20 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                                                s->prob.p.mv_joint);
 
             td->counts.mv_joint[j]++;
-            if (j >= MV_JOINT_V)
-                mv[0].y += read_mv_component(td, 0, hp);
-            if (j & 1)
-                mv[0].x += read_mv_component(td, 1, hp);
+            if (j >= MV_JOINT_V) {
+                mvd_comp = read_mv_component(td, 0, hp);
+                mv[0].y += mvd_comp;
+                mvd_y += mvd_comp;  // videoparser: accumulate MVD
+            }
+            if (j & 1) {
+                mvd_comp = read_mv_component(td, 1, hp);
+                mv[0].x += mvd_comp;
+                mvd_x += mvd_comp;  // videoparser: accumulate MVD
+            }
             // videoparser: accumulate motion bits
             sf->motion_bit_count += td->c->bit_count;
             sf->mv_coded_count++;
+            has_mvd = 1;
         }
 
         if (b->comp) {
@@ -366,14 +439,23 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                                                    s->prob.p.mv_joint);
 
                 td->counts.mv_joint[j]++;
-                if (j >= MV_JOINT_V)
-                    mv[1].y += read_mv_component(td, 0, hp);
-                if (j & 1)
-                    mv[1].x += read_mv_component(td, 1, hp);
+                if (j >= MV_JOINT_V) {
+                    mvd_comp = read_mv_component(td, 0, hp);
+                    mv[1].y += mvd_comp;
+                    mvd_y += mvd_comp;  // videoparser: accumulate MVD
+                }
+                if (j & 1) {
+                    mvd_comp = read_mv_component(td, 1, hp);
+                    mv[1].x += mvd_comp;
+                    mvd_x += mvd_comp;  // videoparser: accumulate MVD
+                }
                 // videoparser: accumulate motion bits
                 sf->motion_bit_count += td->c->bit_count;
                 sf->mv_coded_count++;
             }
         }
+
+        // videoparser: accumulate MV statistics for inter blocks
+        mv_statistics_vp9(sf, mv, b->comp, mvd_x, mvd_y, has_mvd);
     }
 }
