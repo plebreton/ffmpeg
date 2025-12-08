@@ -802,12 +802,20 @@ static av_always_inline void hl_decode_mb_idct_luma(const H264Context *h, H264Sl
 
 // videoparser
 // Function MV_Statistics264 copied from bitstream_mode3_p1204_3 and modified for new parser (motion vector extraction)
+// Set to 1 to enable POC-based motion vector normalization (weighs MVs by temporal distance)
+// Disabled by default to provide raw motion vector statistics
+#ifndef VP_MV_POC_NORMALIZATION
+#define VP_MV_POC_NORMALIZATION 0
+#endif
+
 static void mv_statistics_264(SharedFrameInfo* sf, H264SliceContext* sl, uint32_t curr_type, uint16_t* subtypes,
                               int16_t(*motion_L0)[2], int16_t(*motion_L1)[2],
                               uint8_t(*motion_diff_L0)[2], uint8_t(*motion_diff_L1)[2],
                               uint8_t* ref_L0, uint8_t* ref_L1, int width, int sub_stride, int frame_type) {
     int blk4, blk8, mv_idx, dir_cnt;
+#if VP_MV_POC_NORMALIZATION
     int ref_0_poc, ref_1_poc;
+#endif
     int is_fwd, is_bwd;
     double norm_fwd, norm_bwd;
     double mv_length_xy, mv_length_diff_xy;
@@ -817,6 +825,7 @@ static void mv_statistics_264(SharedFrameInfo* sf, H264SliceContext* sl, uint32_
 
     for (blk8 = 0; blk8 < 4; blk8++) {
         sf->mb_mv_count += 4; // Includes DIRECT mode where no motion is coded, but default prediction is used
+#if VP_MV_POC_NORMALIZATION
         ref_0_poc = sl->ref_list[0][ref_L0[scan8[blk8<<2]]].poc - ((sl->ref_list[0][ref_L0[scan8[blk8<<2]]].poc > 32768) ? 65536 : 0);
         ref_1_poc = sl->ref_list[1][ref_L1[scan8[blk8<<2]]].poc - ((sl->ref_list[1][ref_L1[scan8[blk8<<2]]].poc > 32768) ? 65536 : 0);
 
@@ -827,6 +836,11 @@ static void mv_statistics_264(SharedFrameInfo* sf, H264SliceContext* sl, uint32_
         if ((curr_type & MB_TYPE_L1) || (curr_type & MB_TYPE_DIRECT2)) {
             norm_bwd = 1.0 / (2.0 * fabs(((double)sf->current_poc - (double)ref_1_poc) / sf->poc_diff));
         }
+#else
+        // No POC-based normalization - use raw motion vector values
+        norm_fwd = 1.0;
+        norm_bwd = 1.0;
+#endif
 
         curr_type = ((frame_type == AV_PICTURE_TYPE_B) && (curr_type & MB_TYPE_8x8)) ? subtypes[(blk8 & 1) + (int)(blk8 > 1)*sub_stride] : curr_type;
 
