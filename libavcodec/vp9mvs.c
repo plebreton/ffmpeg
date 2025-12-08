@@ -26,6 +26,8 @@
 #include "vp9data.h"
 #include "vp9dec.h"
 #include "vpx_rac.h"
+#include "vp9shared.h" // videoparser
+#include "libavutil/frame.h" // videoparser
 
 static av_always_inline void clamp_mv(VP9mv *dst, const VP9mv *src,
                                       VP9TileData *td)
@@ -292,6 +294,8 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
 {
     const VP9Context *s = td->s;
     VP9Block *b = td->b;
+    // videoparser
+    SharedFrameInfo *sf = videoparser_get_shared_frame_info(s->s.frames[CUR_FRAME].tf.f);
 
     if (mode == ZEROMV) {
         AV_ZERO32(&mv[0]);
@@ -320,7 +324,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
             }
         }
         if (mode == NEWMV) {
-            enum MVJoint j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
+            enum MVJoint j;
+            td->c->bit_count = 0; // videoparser: reset before MV decoding
+            j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
                                                s->prob.p.mv_joint);
 
             td->counts.mv_joint[j]++;
@@ -328,6 +334,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                 mv[0].y += read_mv_component(td, 0, hp);
             if (j & 1)
                 mv[0].x += read_mv_component(td, 1, hp);
+            // videoparser: accumulate motion bits
+            sf->motion_bit_count += td->c->bit_count;
+            sf->mv_coded_count++;
         }
 
         if (b->comp) {
@@ -351,7 +360,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                 }
             }
             if (mode == NEWMV) {
-                enum MVJoint j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
+                enum MVJoint j;
+                td->c->bit_count = 0; // videoparser: reset before MV decoding
+                j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
                                                    s->prob.p.mv_joint);
 
                 td->counts.mv_joint[j]++;
@@ -359,6 +370,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                     mv[1].y += read_mv_component(td, 0, hp);
                 if (j & 1)
                     mv[1].x += read_mv_component(td, 1, hp);
+                // videoparser: accumulate motion bits
+                sf->motion_bit_count += td->c->bit_count;
+                sf->mv_coded_count++;
             }
         }
     }

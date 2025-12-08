@@ -1301,12 +1301,18 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
 
         if (!b->skip) {
             int has_coeffs;
+            // videoparser
+            SharedFrameInfo *sf = videoparser_get_shared_frame_info(f);
+            td->c->bit_count = 0;
 
             if (bytesperpixel == 1) {
                 has_coeffs = decode_coeffs_8bpp(td);
             } else {
                 has_coeffs = decode_coeffs_16bpp(td);
             }
+            // videoparser: accumulate coefficient bits
+            sf->coefs_bit_count += td->c->bit_count;
+
             if (!has_coeffs && b->bs <= BS_8x8 && !b->intra) {
                 b->skip = 1;
                 memset(&s->above_skip_ctx[col], 1, w4);

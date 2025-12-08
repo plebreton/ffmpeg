@@ -40,6 +40,7 @@ typedef struct VPXRangeCoder {
     const uint8_t *end;
     unsigned int code_word;
     int end_reached;
+    int bit_count; /* videoparser: tracks bits consumed for motion/coef counting */
 } VPXRangeCoder;
 
 extern const uint8_t ff_vpx_norm_shift[256];
@@ -89,6 +90,7 @@ static av_always_inline int vpx_rac_get_prob(VPXRangeCoder *c, uint8_t prob)
 
     c->high = bit ? c->high - low : low;
     c->code_word = bit ? code_word - low_shift : code_word;
+    c->bit_count++; // videoparser
 
     return bit;
 }
@@ -102,6 +104,7 @@ static av_always_inline int vpx_rac_get_prob_branchy(VPXRangeCoder *c, int prob)
     unsigned low = 1 + (((c->high - 1) * prob) >> 8);
     unsigned low_shift = low << 16;
 
+    c->bit_count++; // videoparser
     if (code_word >= low_shift) {
         c->high     -= low;
         c->code_word = code_word - low_shift;
@@ -129,6 +132,7 @@ static av_always_inline int vpx_rac_get(VPXRangeCoder *c)
     }
 
     c->code_word = code_word;
+    c->bit_count++; // videoparser
     return bit;
 }
 
