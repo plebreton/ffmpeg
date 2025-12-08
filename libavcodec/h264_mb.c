@@ -803,7 +803,7 @@ static av_always_inline void hl_decode_mb_idct_luma(const H264Context *h, H264Sl
 // videoparser
 // Function MV_Statistics264 copied from bitstream_mode3_p1204_3 and modified for new parser (motion vector extraction)
 static void mv_statistics_264(SharedFrameInfo* sf, H264SliceContext* sl, uint32_t curr_type, uint16_t* subtypes,
-                              uint8_t(*motion_L0)[2], uint8_t(*motion_L1)[2],
+                              int16_t(*motion_L0)[2], int16_t(*motion_L1)[2],
                               uint8_t(*motion_diff_L0)[2], uint8_t(*motion_diff_L1)[2],
                               uint8_t* ref_L0, uint8_t* ref_L1, int width, int sub_stride, int frame_type) {
     int blk4, blk8, mv_idx, dir_cnt;
@@ -840,13 +840,14 @@ static void mv_statistics_264(SharedFrameInfo* sf, H264SliceContext* sl, uint32_
             || ((curr_type & MB_TYPE_16x8) && (((blk8 < 2) && (curr_type & MB_TYPE_P0L1)) || ((blk8 > 1) && (curr_type & MB_TYPE_P1L1))))
             || ((curr_type & MB_TYPE_8x16) && ((!(blk8 & 1) && (curr_type & MB_TYPE_P0L1)) || ((blk8 & 1) && (curr_type & MB_TYPE_P1L1))));
 
-        if (is_fwd && ((sf->current_poc - ref_0_poc) == 0)) {
-            ref_0_poc = ref_0_poc;
-        }
+        // unneeded: warning: explicitly assigning value of variable of type 'int' to itself [-Wself-assign]
+        // if (is_fwd && ((sf->current_poc - ref_0_poc) == 0)) {
+        //     ref_0_poc = ref_0_poc;
+        // }
 
-        if (is_bwd && ((sf->current_poc - ref_1_poc) == 0)) {
-            ref_1_poc = ref_1_poc;
-        }
+        // if (is_bwd && ((sf->current_poc - ref_1_poc) == 0)) {
+        //     ref_1_poc = ref_1_poc;
+        // }
 
         for (blk4 = 0; blk4 < 4; blk4++) {
             mv_idx = scan8[(blk8 << 2) + blk4];
@@ -932,8 +933,8 @@ void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl)
         if ((frame_type != AV_PICTURE_TYPE_I) && !mb_type_I) {
             if (!(mb_type & MB_TYPE_SKIP)) {
                 mv_statistics_264(sf, sl, mb_type, sl->sub_mb_type,
-                                  (uint8_t (*)[2]) sl->mv_cache[0], (uint8_t (*)[2]) sl->mv_cache[1],
-                                  (uint8_t (*)[2]) sl->mvd_cache[0], (uint8_t (*)[2]) sl->mvd_cache[1],
+                                  sl->mv_cache[0], sl->mv_cache[1],
+                                  sl->mvd_cache[0], sl->mvd_cache[1],
                                   sl->ref_cache[0], sl->ref_cache[1], h->mb_width<<2, (h->mb_stride << 1), frame_type);
             }
         }
