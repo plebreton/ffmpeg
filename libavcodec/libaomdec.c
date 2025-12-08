@@ -39,9 +39,43 @@
 #include "libaom.h"
 #include "profiles.h"
 
+// videoparser: Include inspection API for MV extraction
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+#include "av1/decoder/inspection.h"
+#include "av1/common/enums.h"
+#include <math.h>
+#endif
+
+// videoparser: Helper macro
+#define VP_SQR(_x_) ((_x_) * (_x_))
+
 typedef struct AV1DecodeContext {
     struct aom_codec_ctx decoder;
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+    // videoparser: Inspection data for MV extraction
+    insp_frame_data insp_data;
+    int insp_data_initialized;
+    int insp_data_valid;  // Set when inspection callback has been called
+#endif
 } AV1DecodeContext;
+
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+// videoparser: Inspection callback to capture frame data for MV extraction
+// The callback signature from libaom is: void (*aom_inspect_cb)(void *decoder, void *ctx)
+static void videoparser_av1_inspect_callback(void *pbi, void *user_data) {
+    AV1DecodeContext *ctx = (AV1DecodeContext *)user_data;
+    if (!ctx)
+        return;
+
+    ctx->insp_data_valid = 0;
+
+    // Call ifd_inspect to fill the inspection data
+    // Note: This captures MV, mode, and other per-block information
+    if (ifd_inspect(&ctx->insp_data, pbi, 0) == 1) {
+        ctx->insp_data_valid = 1;
+    }
+}
+#endif
 
 static av_cold int aom_init(AVCodecContext *avctx,
                             const struct aom_codec_iface *iface)
@@ -60,6 +94,24 @@ static av_cold int aom_init(AVCodecContext *avctx,
                error);
         return AVERROR(EINVAL);
     }
+
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+    // videoparser: Set up inspection callback for MV extraction
+    {
+        aom_inspect_init ii;
+        ii.inspect_cb = videoparser_av1_inspect_callback;
+        ii.inspect_ctx = ctx;
+        ctx->insp_data_initialized = 0;
+        ctx->insp_data_valid = 0;
+        ctx->insp_data.mi_grid = NULL;
+
+        if (aom_codec_control(&ctx->decoder, AV1_SET_INSPECTION_CALLBACK, &ii) != AOM_CODEC_OK) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to set inspection callback, MV extraction disabled\n");
+        } else {
+            av_log(avctx, AV_LOG_VERBOSE, "videoparser: AV1 inspection callback enabled for MV extraction\n");
+        }
+    }
+#endif
 
     return 0;
 }
@@ -195,6 +247,137 @@ static int decode_metadata(AVFrame *frame, const struct aom_image *img)
     return 0;
 }
 
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+/**
+ * videoparser: Extract motion vector statistics from AV1 inspection data.
+ * This is called after decoding each frame to populate SharedFrameInfo.
+ *
+ * AV1 motion vectors are in 1/8 pel units (same as VP9).
+ * We iterate over all MI blocks and extract MV data for inter blocks.
+ */
+static void videoparser_av1_extract_mv_stats(AVFrame *picture, AV1DecodeContext *ctx)
+{
+    if (!ctx->insp_data_valid || !ctx->insp_data.mi_grid) {
+        av_log(NULL, AV_LOG_DEBUG, "videoparser: AV1 MV extraction skipped - insp_data_valid=%d, mi_grid=%p\n",
+               ctx->insp_data_valid, (void*)ctx->insp_data.mi_grid);
+        return;
+    }
+
+    SharedFrameInfo *sf = videoparser_get_shared_frame_info(picture);
+    if (!sf)
+        return;
+
+    const insp_frame_data *fd = &ctx->insp_data;
+    const int mi_rows = fd->mi_rows;
+    const int mi_cols = fd->mi_cols;
+    int inter_blocks = 0;  // Debug counter
+
+    // Iterate over all MI blocks
+    for (int mi_row = 0; mi_row < mi_rows; mi_row++) {
+        for (int mi_col = 0; mi_col < mi_cols; mi_col++) {
+            const insp_mi_data *mi = &fd->mi_grid[mi_row * mi_cols + mi_col];
+
+            // Check if this is an inter block (mode >= NEARESTMV)
+            // In AV1/libaom enums: NEARESTMV=13, NEARMV=14, GLOBALMV=15, NEWMV=16,
+            // and compound modes start from NEAREST_NEARESTMV=17
+            // Intra modes are DC_PRED=0 to PAETH_PRED=12
+            if (mi->mode < NEARESTMV)
+                continue;  // Skip intra blocks
+
+            // Skip blocks with INTRA_FRAME reference (ref_frame[0] == 0 means INTRA_FRAME)
+            // In AV1: INTRA_FRAME=0, LAST_FRAME=1, etc.
+            if (mi->ref_frame[0] <= 0)
+                continue;
+
+            double mv_x = 0.0, mv_y = 0.0;
+            int dir_cnt = 0;
+
+            // L0 reference
+            if (mi->ref_frame[0] > 0) {
+                dir_cnt++;
+                mv_x += fabs((double)mi->mv[0].col);
+                mv_y += fabs((double)mi->mv[0].row);
+            }
+
+            // L1 reference (compound mode)
+            if (mi->ref_frame[1] > 0) {
+                dir_cnt++;
+                mv_x += fabs((double)mi->mv[1].col);
+                mv_y += fabs((double)mi->mv[1].row);
+            }
+
+            if (dir_cnt == 0)
+                continue;
+
+            // Average across directions for compound blocks
+            if (dir_cnt > 1) {
+                mv_x /= dir_cnt;
+                mv_y /= dir_cnt;
+            }
+
+            // Calculate magnitude
+            double mv_length_xy = sqrt(VP_SQR(mv_x) + VP_SQR(mv_y));
+
+            // videoparser: Extract MVD (motion vector difference) from inspection data
+            // MVD is now captured during decoding in libaom
+            double mvd_x = 0.0, mvd_y = 0.0;
+            int mvd_dir_cnt = 0;
+
+            // L0 MVD
+            if (mi->ref_frame[0] > 0 && (mi->mvd[0].col != 0 || mi->mvd[0].row != 0)) {
+                mvd_dir_cnt++;
+                mvd_x += fabs((double)mi->mvd[0].col);
+                mvd_y += fabs((double)mi->mvd[0].row);
+            }
+
+            // L1 MVD (compound mode)
+            if (mi->ref_frame[1] > 0 && (mi->mvd[1].col != 0 || mi->mvd[1].row != 0)) {
+                mvd_dir_cnt++;
+                mvd_x += fabs((double)mi->mvd[1].col);
+                mvd_y += fabs((double)mi->mvd[1].row);
+            }
+
+            // Average across directions for compound blocks
+            if (mvd_dir_cnt > 1) {
+                mvd_x /= mvd_dir_cnt;
+                mvd_y /= mvd_dir_cnt;
+            }
+
+            double mvd_len = sqrt(VP_SQR(mvd_x) + VP_SQR(mvd_y));
+
+            // Accumulate statistics
+            sf->mv_length += mv_length_xy;
+            sf->mv_sum_sqr += VP_SQR(mv_length_xy);
+            sf->mv_x_length += mv_x;
+            sf->mv_y_length += mv_y;
+            sf->mv_x_sum_sqr += VP_SQR(mv_x);
+            sf->mv_y_sum_sqr += VP_SQR(mv_y);
+            sf->mv_length_diff += mvd_len;
+            sf->mv_diff_sum_sqr += VP_SQR(mvd_len);
+
+            sf->mb_mv_count++;
+
+            // Count coded MVs (NEWMV and compound NEWMV modes)
+            // NEWMV=16, NEW_NEWMV=24, NEAREST_NEWMV=19, NEW_NEARESTMV=20, etc.
+            if (mi->mode == NEWMV || mi->mode == NEW_NEWMV ||
+                mi->mode == NEAREST_NEWMV || mi->mode == NEW_NEARESTMV ||
+                mi->mode == NEAR_NEWMV || mi->mode == NEW_NEARMV) {
+                sf->mv_coded_count++;
+            }
+            inter_blocks++;
+        }
+    }
+
+    // videoparser: Extract bit counts from inspection data
+    sf->motion_bit_count = fd->motion_bits;
+    sf->coefs_bit_count = fd->coef_bits;
+
+    av_log(NULL, AV_LOG_DEBUG, "videoparser: AV1 frame has %d inter blocks out of %d total MI blocks, mb_mv_count=%d, motion_bits=%llu, coef_bits=%llu\n",
+           inter_blocks, mi_rows * mi_cols, sf->mb_mv_count,
+           (unsigned long long)sf->motion_bit_count, (unsigned long long)sf->coefs_bit_count);
+}
+#endif
+
 static int aom_decode(AVCodecContext *avctx, AVFrame *picture,
                       int *got_frame, AVPacket *avpkt)
 {
@@ -283,6 +466,12 @@ static int aom_decode(AVCodecContext *avctx, AVFrame *picture,
             av_log(avctx, AV_LOG_ERROR, "Failed to decode metadata\n");
             return ret;
         }
+
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+        // videoparser: Extract MV statistics from inspection data
+        videoparser_av1_extract_mv_stats(picture, ctx);
+#endif
+
         *got_frame = 1;
     }
     return avpkt->size;
@@ -291,6 +480,14 @@ static int aom_decode(AVCodecContext *avctx, AVFrame *picture,
 static av_cold int aom_free(AVCodecContext *avctx)
 {
     AV1DecodeContext *ctx = avctx->priv_data;
+
+#ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+    // videoparser: Clean up inspection data
+    if (ctx->insp_data.mi_grid) {
+        ifd_clear(&ctx->insp_data);
+    }
+#endif
+
     aom_codec_destroy(&ctx->decoder);
     return 0;
 }
