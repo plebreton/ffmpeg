@@ -3465,6 +3465,33 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
     if (ret < 0)
         goto fail;
 
+    // videoparser: Track POC changes for HEVC
+    {
+        static int prev_poc = 0, poc_diff = 8;
+        static int64_t prev_pts = 0;
+        int pts_diff;
+        AVFrame *frame = s->cur_frame->f;
+        SharedFrameInfo *sf = videoparser_get_shared_frame_info(frame);
+
+        if (sf) {
+            // HEVC POC values are signed and can be negative, use directly
+            sf->current_poc = s->poc;
+
+            if (abs(sf->current_poc - prev_poc) != 0) {
+                if ((frame->pts == 0) || (frame->duration == 0)) {
+                    poc_diff = FFMIN(poc_diff, abs(sf->current_poc - prev_poc));
+                } else {
+                    pts_diff = FFMAX(1, (int)nearbyint(fabs((double)frame->pts - prev_pts) / (double)frame->duration));
+                    poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
+                }
+            }
+
+            sf->poc_diff = poc_diff;
+            prev_poc = sf->current_poc;
+            prev_pts = frame->pts;
+        }
+    }
+
     ret = ff_hevc_frame_rps(s, l);
     if (ret < 0) {
         av_log(s->avctx, AV_LOG_ERROR, "Error constructing the frame RPS.\n");
