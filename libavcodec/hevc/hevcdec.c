@@ -3467,7 +3467,7 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
 
     // videoparser: Track POC changes for HEVC
     {
-        static int prev_poc = 0, poc_diff = 8;
+        static int prev_poc = 0, poc_diff = -1; // -1 = not yet calculated
         static int64_t prev_pts = 0;
         int pts_diff;
         AVFrame *frame = s->cur_frame->f;
@@ -3478,15 +3478,18 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
             sf->current_poc = s->poc;
 
             if (abs(sf->current_poc - prev_poc) != 0) {
+                int new_poc_diff;
                 if ((frame->pts == 0) || (frame->duration == 0)) {
-                    poc_diff = FFMIN(poc_diff, abs(sf->current_poc - prev_poc));
+                    new_poc_diff = abs(sf->current_poc - prev_poc);
                 } else {
                     pts_diff = FFMAX(1, (int)nearbyint(fabs((double)frame->pts - prev_pts) / (double)frame->duration));
-                    poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
+                    new_poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
                 }
+                // Set poc_diff: first time directly, afterwards take minimum
+                poc_diff = (poc_diff < 0) ? new_poc_diff : FFMIN(poc_diff, new_poc_diff);
             }
 
-            sf->poc_diff = poc_diff;
+            sf->poc_diff = poc_diff; // -1 if not yet calculated
             prev_poc = sf->current_poc;
             prev_pts = frame->pts;
         }

@@ -2564,7 +2564,7 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
     int ret;
 
     // videoparser
-    static int prev_poc=0, poc_diff=8; // Stores previous Proof of Concept (POC) and an initial expected POC difference
+    static int prev_poc=0, poc_diff=-1; // Stores previous POC and POC difference (-1 = not yet calculated)
     static int64_t prev_pts; // Stores previous Presentation Timestamp (PTS)
     int pts_diff; // Stores calculated difference between current and previous PTS
     H264Picture *curr_pic;
@@ -2605,15 +2605,18 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
     sf->current_poc = curr_pic->poc - ((curr_pic->poc > 32768) ? 65536 : 0);
 
     if (abs(sf->current_poc - prev_poc) != 0) {
+        int new_poc_diff;
         if ((frame->pts == 0) || (frame->duration == 0)) {
-            poc_diff = FFMIN(poc_diff, abs(sf->current_poc - prev_poc));
+            new_poc_diff = abs(sf->current_poc - prev_poc);
         } else {
             pts_diff = FFMAX(1, (int)nearbyint(fabs((double)frame->pts - prev_pts) / (double)frame->duration));
-            poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
+            new_poc_diff = abs(sf->current_poc - prev_poc) / pts_diff;
         }
+        // Set poc_diff: first time directly, afterwards take minimum
+        poc_diff = (poc_diff < 0) ? new_poc_diff : FFMIN(poc_diff, new_poc_diff);
     }
 
-    sf->poc_diff = poc_diff;
+    sf->poc_diff = poc_diff; // -1 if not yet calculated
     prev_poc = sf->current_poc;
     prev_pts = frame->pts;
 
