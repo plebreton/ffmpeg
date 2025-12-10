@@ -37,9 +37,6 @@
 // videoparser
 #define SQR(_x_) (_x_) * (_x_)
 
-// videoparser
-#define SQR(_x_) (_x_) * (_x_)
-
 /**
  * @brief Initialize the shared frame info for the videoparser, or return the existing one.
  *
@@ -211,8 +208,19 @@ SharedFrameInfo *videoparser_get_final_shared_frame_info(AVFrame *frame) {
                                  SQR(sf->mv_y_length / num_motion));
         sf->motion_stdev = sqrt(0.00001 + sf->mv_sum_sqr / num_motion -
                                SQR(sf->mv_length / num_motion));
+#if VP_MV_POC_NORMALIZATION
+        // LEGACY BUG REPLICATION: The legacy parser (VideoStatCommon.c line 195) uses
+        // MV_DifSum in the stdev formula, but MV_DifSum is never accumulated (only
+        // MV_dLength is). Since MV_DifSum is always 0, the legacy formula becomes:
+        //   sqrt(0.00001 + sum_sqr/n - 0) = sqrt(0.00001 + sum_sqr/n)
+        // This computes RMS (root mean square), not true standard deviation.
+        // The correct formula would subtract SQR(mv_length_diff / num_diffs).
+        // We replicate this bug here for exact legacy compatibility.
+        sf->motion_diff_stdev = sqrt(0.00001 + sf->mv_diff_sum_sqr / num_diffs);
+#else
         sf->motion_diff_stdev = sqrt(0.00001 + sf->mv_diff_sum_sqr / num_diffs -
                                     SQR(sf->mv_length_diff / num_diffs));
+#endif
       }
     }
 

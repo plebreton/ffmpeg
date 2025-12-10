@@ -2437,36 +2437,53 @@ static void intra_prediction_unit_default_value(HEVCLocalContext *lc,
 // videoparser
 #define SQR(_x_) ((_x_) * (_x_))
 
+// videoparser: Set to 1 to enable POC-based motion vector normalization (weighs MVs by temporal distance)
+// Disabled by default to provide raw motion vector statistics
+#ifndef VP_MV_POC_NORMALIZATION
+#define VP_MV_POC_NORMALIZATION 0
+#endif
+
 /**
- * Raw motion vector statistics extraction for HEVC.
- * Extracts MV and MVD values without POC-based normalization.
+ * Motion vector statistics extraction for HEVC.
+ * When VP_MV_POC_NORMALIZATION is enabled, MVs are normalized by temporal distance
+ * to reference frames. Otherwise, raw MV values are used.
  * Motion vectors are in quarter-pel units (HEVC uses 1/4 pel precision).
+ *
+ * This function matches the legacy parser behavior:
+ * - norm_fwd/norm_bwd are pre-calculated based on the base PU's type for the min CB
+ * - A norm value of 0.0 means that prediction direction is not active
+ * - The caller is responsible for incrementing mb_mv_count
  *
  * @param sf SharedFrameInfo to accumulate statistics into
  * @param mv_field MvField containing motion vectors for the prediction unit
+ * @param norm_fwd Normalization factor for L0 (forward) prediction (0.0 if not active)
+ * @param norm_bwd Normalization factor for L1 (backward) prediction (0.0 if not active)
  */
-static void mv_statistics_hevc(SharedFrameInfo *sf, const MvField *mv_field) {
+static void mv_statistics_hevc(SharedFrameInfo *sf, const MvField *mv_field,
+                               double norm_fwd, double norm_bwd) {
     double mv_x = 0.0, mv_y = 0.0;
     double mvd_x = 0.0, mvd_y = 0.0;
     double mv_length_xy, mvd_length_xy;
     int dir_cnt = 0;
 
-    // Check L0 (forward) prediction
-    if (mv_field->pred_flag & PF_L0) {
+    // Check L0 (forward) prediction - only if norm_fwd is active (non-zero)
+    // Legacy: if( NormFwd != 0.0)
+    if (norm_fwd != 0.0) {
         dir_cnt++;
-        mv_x = fabs((double)mv_field->mv[0].x);
-        mv_y = fabs((double)mv_field->mv[0].y);
-        mvd_x = fabs((double)mv_field->mvd[0].x);
-        mvd_y = fabs((double)mv_field->mvd[0].y);
+        mv_x = fabs((double)mv_field->mv[0].x) * norm_fwd;
+        mv_y = fabs((double)mv_field->mv[0].y) * norm_fwd;
+        mvd_x = fabs((double)mv_field->mvd[0].x) * norm_fwd;
+        mvd_y = fabs((double)mv_field->mvd[0].y) * norm_fwd;
     }
 
-    // Check L1 (backward) prediction
-    if (mv_field->pred_flag & PF_L1) {
+    // Check L1 (backward) prediction - only if norm_bwd is active (non-zero)
+    // Legacy: if( NormBwd != 0.0)
+    if (norm_bwd != 0.0) {
         dir_cnt++;
-        mv_x += fabs((double)mv_field->mv[1].x);
-        mv_y += fabs((double)mv_field->mv[1].y);
-        mvd_x += fabs((double)mv_field->mvd[1].x);
-        mvd_y += fabs((double)mv_field->mvd[1].y);
+        mv_x += fabs((double)mv_field->mv[1].x) * norm_bwd;
+        mv_y += fabs((double)mv_field->mv[1].y) * norm_bwd;
+        mvd_x += fabs((double)mv_field->mvd[1].x) * norm_bwd;
+        mvd_y += fabs((double)mv_field->mvd[1].y) * norm_bwd;
     }
 
     if (dir_cnt > 0) {
@@ -2489,22 +2506,32 @@ static void mv_statistics_hevc(SharedFrameInfo *sf, const MvField *mv_field) {
         sf->mv_y_sum_sqr += SQR(mv_y);
         sf->mv_length_diff += mvd_length_xy;
         sf->mv_diff_sum_sqr += SQR(mvd_length_xy);
-
-        sf->mb_mv_count++;
+        // Note: mb_mv_count is now incremented by the caller (mb_statistics_hevc)
     }
 }
 
 // videoparser
 // Function MbStatistcsHEVC - extracts motion vector statistics for a coding unit
-static void mb_statistics_hevc(const HEVCContext *s, const HEVCSPS *sps,
-                               int x0, int y0, int log2_cb_size) {
+// Matches legacy parser iteration EXACTLY (including overlapping access pattern)
+static void mb_statistics_hevc(const HEVCContext *s, const HEVCLocalContext *lc,
+                               const HEVCSPS *sps, int x0, int y0, int log2_cb_size) {
     SharedFrameInfo *sf;
     const MvField *tab_mvf;
     const MvField *mv_field;
+    const MvField *base_mv_field;
     int pict_type;
-    int i, j, x_pu, y_pu;
-    int size_in_pus;
+    int i, j, h, v;
+    int x_pu, y_pu;
     int min_pu_width;
+    int qp_length;          // Legacy: 1 << (log_cb_size - log2_min_cb_size)
+    int mvs;                // Legacy: 1 << (log2_min_cb_size - log2_min_pu_size)
+    int coding_type;        // Legacy GetCodingTypeHEVC result
+#if VP_MV_POC_NORMALIZATION
+    const RefPicList *ref_pic_list;
+    int current_poc;
+    int ref_0_poc, ref_1_poc;
+#endif
+    double norm_fwd, norm_bwd;
 
     // Skip I frames - no motion vectors
     pict_type = s->cur_frame->f->pict_type;
@@ -2522,20 +2549,107 @@ static void mb_statistics_hevc(const HEVCContext *s, const HEVCSPS *sps,
         return;
     }
 
+#if VP_MV_POC_NORMALIZATION
+    ref_pic_list = s->cur_frame->refPicList;
+    if (!ref_pic_list) {
+        return;
+    }
+
+    // Get current POC, handling wraparound
+    current_poc = s->cur_frame->poc;
+    current_poc = current_poc - ((current_poc > 32768) ? 65536 : 0);
+#endif
+
     min_pu_width = sps->min_pu_width;
-    size_in_pus = (1 << log2_cb_size) >> sps->log2_min_pu_size;
     x_pu = x0 >> sps->log2_min_pu_size;
     y_pu = y0 >> sps->log2_min_pu_size;
 
-    // Iterate over all prediction units in the coding unit
-    for (j = 0; j < size_in_pus; j++) {
-        for (i = 0; i < size_in_pus; i++) {
-            mv_field = &tab_mvf[(y_pu + j) * min_pu_width + x_pu + i];
+    // Match legacy iteration exactly:
+    // Legacy: qp_length = 1 << (log_cb_size - sps->log2_min_cb_size)
+    // Legacy: MBs = 1 << (sps->log2_min_cb_size - sps->log2_min_pu_size)
+    qp_length = 1 << (log2_cb_size - sps->log2_min_cb_size);
+    mvs = 1 << (sps->log2_min_cb_size - sps->log2_min_pu_size);
 
-            // Only process inter-predicted blocks with motion vectors
-            // pred_flag: 0=INTRA, 1=L0, 2=L1, 3=BI
-            if (mv_field->pred_flag != PF_INTRA && mv_field->pred_flag != 0) {
-                mv_statistics_hevc(sf, mv_field);
+    // Legacy outer loop: for(j=0; j<qp_length; j++) for(i=0; i<qp_length; i++)
+    // Note: j,i increment by 1 (PU units), NOT by mvs!
+    for (j = 0; j < qp_length; j++) {
+        for (i = 0; i < qp_length; i++) {
+            // Legacy: MvF = tab_mvf + (y_pu + j)*min_pu_width + x_pu + i
+            base_mv_field = &tab_mvf[(y_pu + j) * min_pu_width + x_pu + i];
+
+            // Legacy GetCodingTypeHEVC logic:
+            // if (lc->cu.pred_mode == MODE_INTRA) return 5 or 6 (INTRA)
+            // else if (lc->cu.pred_mode == MODE_SKIP) return (B-frame ? 4 : 0) (DIRECT or SKIPPED)
+            // else return ((B-frame && pred_flag==0) ? 4 : pred_flag)
+            if (lc->cu.pred_mode == MODE_INTRA) {
+                coding_type = 5;  // INTRA_BLK
+            } else if (lc->cu.pred_mode == MODE_SKIP) {
+                coding_type = (pict_type == AV_PICTURE_TYPE_B) ? 4 : 0;  // DIRECT or SKIPPED
+            } else {
+                // MODE_INTER
+                coding_type = ((pict_type == AV_PICTURE_TYPE_B) && (base_mv_field->pred_flag == 0)) ?
+                              4 : base_mv_field->pred_flag;
+            }
+
+            // Legacy: if((Type != SKIPPED) && (Type < INTRA_BLK))
+            // SKIPPED=0, INTRA_BLK=5
+            // Process types 1,2,3,4 = FORWARD, BACKWARD, BIDIRECT, DIRECT
+            if (coding_type == 0 || coding_type >= 5) {
+                // Skip - either SKIPPED or INTRA
+                continue;
+            }
+
+            // Calculate normalization factors based on coding type
+            norm_fwd = 0.0;
+            norm_bwd = 0.0;
+
+#if VP_MV_POC_NORMALIZATION
+            // Get reference POCs
+            ref_0_poc = ref_pic_list[0].list[base_mv_field->ref_idx[0]];
+            ref_0_poc = ref_0_poc - ((ref_0_poc > 32768) ? 65536 : 0);
+            ref_1_poc = ref_pic_list[1].list[base_mv_field->ref_idx[1]];
+            ref_1_poc = ref_1_poc - ((ref_1_poc > 32768) ? 65536 : 0);
+
+            // Legacy: if((CurrType == FORWARD) || (CurrType == DIRECT) || (CurrType == BIDIRECT))
+            // FORWARD=1, DIRECT=4, BIDIRECT=3
+            if (coding_type == 1 || coding_type == 3 || coding_type == 4) {
+                if (sf->poc_diff > 0) {
+                    double temporal_dist = fabs((double)(current_poc - ref_0_poc) / sf->poc_diff);
+                    if (temporal_dist > 0) {
+                        norm_fwd = 1.0 / (2.0 * temporal_dist);
+                    }
+                }
+            }
+            // Legacy: if((CurrType == BACKWARD) || (CurrType == DIRECT) || (CurrType == BIDIRECT))
+            // BACKWARD=2, DIRECT=4, BIDIRECT=3
+            if (coding_type == 2 || coding_type == 3 || coding_type == 4) {
+                if (sf->poc_diff > 0) {
+                    double temporal_dist = fabs((double)(current_poc - ref_1_poc) / sf->poc_diff);
+                    if (temporal_dist > 0) {
+                        norm_bwd = 1.0 / (2.0 * temporal_dist);
+                    }
+                }
+            }
+#else
+            // No POC normalization
+            if (coding_type == 1 || coding_type == 3 || coding_type == 4) {
+                norm_fwd = 1.0;
+            }
+            if (coding_type == 2 || coding_type == 3 || coding_type == 4) {
+                norm_bwd = 1.0;
+            }
+#endif
+
+            // Legacy: NumBlksMv += Mvs * Mvs (counted once per outer iteration that passes the Type check)
+            sf->mb_mv_count += mvs * mvs;
+
+            // Legacy inner loop: for(h=0; h<Mvs; h++) for(v=0; v<Mvs; v++)
+            // CurrMvF = MvF + h*MinPuWidth + v
+            for (h = 0; h < mvs; h++) {
+                for (v = 0; v < mvs; v++) {
+                    mv_field = &tab_mvf[(y_pu + j + h) * min_pu_width + x_pu + i + v];
+                    mv_statistics_hevc(sf, mv_field, norm_fwd, norm_bwd);
+                }
             }
         }
     }
@@ -2721,7 +2835,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
     // videoparser
     videoparser_shared_frame_info_update_qp(s->cur_frame->f, lc->qp_y);
 
-    mb_statistics_hevc(s, sps, x0, y0, log2_cb_size);
+    mb_statistics_hevc(s, lc, sps, x0, y0, log2_cb_size);
 
     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
