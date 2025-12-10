@@ -189,10 +189,10 @@ SharedFrameInfo *videoparser_get_final_shared_frame_info(AVFrame *frame) {
     }
 
     // calculate final QP statistics from internal fields
-    sf->qp_avg = sf->qp_sum / sf->qp_cnt;
-    sf->qp_stdev = sqrt(sf->qp_sum_sqr / sf->qp_cnt - sf->qp_avg * sf->qp_avg);
-    sf->qp_bb_avg = sf->qp_sum_bb / sf->qp_cnt_bb;
-    sf->qp_bb_stdev = sqrt(sf->qp_sum_sqr_bb / sf->qp_cnt_bb - sf->qp_bb_avg * sf->qp_bb_avg);
+    sf->qp_avg = (double)sf->qp_sum / sf->qp_cnt;
+    sf->qp_stdev = sqrt((double)sf->qp_sum_sqr / sf->qp_cnt - sf->qp_avg * sf->qp_avg);
+    sf->qp_bb_avg = (double)sf->qp_sum_bb / sf->qp_cnt_bb;
+    sf->qp_bb_stdev = sqrt((double)sf->qp_sum_sqr_bb / sf->qp_cnt_bb - sf->qp_bb_avg * sf->qp_bb_avg);
 
     // calculate motion vector statistics
     frame_type = frame->pict_type;
