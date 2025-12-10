@@ -33,52 +33,205 @@
 // videoparser
 #define SQR(_x_) ((_x_) * (_x_))
 
+// videoparser: Block size to 4x4 count lookup table
+// Index by BlockSize enum, value is number of 4x4 blocks in that block size
+// Calculated from ff_vp9_bwh_tab[0][bs][0] * ff_vp9_bwh_tab[0][bs][1]
+static const int vp9_bs_to_4x4_count[N_BS_SIZES] = {
+    256,  // BS_64x64: 16*16
+    128,  // BS_64x32: 16*8
+    128,  // BS_32x64: 8*16
+     64,  // BS_32x32: 8*8
+     32,  // BS_32x16: 8*4
+     32,  // BS_16x32: 4*8
+     16,  // BS_16x16: 4*4
+      8,  // BS_16x8:  4*2
+      8,  // BS_8x16:  2*4
+      4,  // BS_8x8:   2*2
+      2,  // BS_8x4:   2*1
+      2,  // BS_4x8:   1*2
+      1,  // BS_4x4:   1*1
+};
+
+// videoparser: POC-based motion vector normalization flag for VP9
+// When enabled, replicates legacy parser behavior for compatibility
+// See DEVELOPERS.md for details on the legacy implementation
+#ifndef VP_MV_POC_NORMALIZATION
+#define VP_MV_POC_NORMALIZATION 0
+#endif
+
+// videoparser: Debug flag for investigating frame distance calculation
+// Enable with: -DVP_MV_DEBUG_FRMDIST=1
+#ifndef VP_MV_DEBUG_FRMDIST
+#define VP_MV_DEBUG_FRMDIST 0
+#endif
+
+#if VP_MV_DEBUG_FRMDIST
+#include <stdio.h>
+#include <inttypes.h>
+static int vp9_debug_frame_count = 0;
+static int64_t vp9_debug_last_pts = INT64_MIN;
+static double vp9_debug_frmdist_sum = 0.0;
+static int vp9_debug_frmdist_count = 0;
+static int vp9_debug_checked_init = 0;  // Track if we've checked init for this frame
+static int vp9_debug_ref_count[3] = {0, 0, 0};  // Count blocks by reference type (LAST, GOLDEN, ALTREF)
+#endif
+
 /**
- * Raw motion vector statistics extraction for VP9.
- * Extracts MV values without any normalization.
- * Motion vectors are in 1/8 pel units (VP9 uses 1/8 pel precision).
+ * Motion vector statistics extraction for VP9.
+ *
+ * When VP_MV_POC_NORMALIZATION=0 (default):
+ *   - Extracts MV values without any normalization
+ *   - Motion vectors are in 1/8 pel units (VP9 native precision)
+ *   - Stats accumulated for all inter modes (NEARESTMV, NEARMV, NEWMV)
+ *
+ * When VP_MV_POC_NORMALIZATION=1 (legacy mode):
+ *   - Normalizes MVs by temporal distance: mv / (8 * FrmDist)
+ *   - Applies 4x multiplier to MV lengths: MV_Length = 4.0 * sqrt(...)
+ *   - Only accumulates stats for NEWMV mode blocks
+ *   - Uses block-size weighted counting (count = number of 4x4 blocks)
+ *   - Uses count*count weighting for variance (legacy behavior)
+ *   - Applies outlier rejection: blocks where MV > 20x running average are rejected
  *
  * @param sf SharedFrameInfo to accumulate statistics into
  * @param mv Motion vector array [0]=L0, [1]=L1
  * @param comp Whether this is compound (bi-predictive) mode
  * @param mvd_x MVD x component (only valid for NEWMV mode)
  * @param mvd_y MVD y component (only valid for NEWMV mode)
- * @param has_mvd Whether MVD values are valid
+ * @param is_newmv Whether this is NEWMV mode (explicitly coded MV)
+ * @param frm_dist Frame distance for POC normalization (only used when VP_MV_POC_NORMALIZATION=1)
+ * @param bs Block size enum for this block
+ * @param sb Sub-block index (-1 for full block, 0-3 for sub-blocks)
+ * @param coded_mv_cnt Number of non-zero MV joints coded (0, 1, or 2 for compound) - legacy mode only
  */
 static void mv_statistics_vp9(SharedFrameInfo *sf, const VP9mv *mv,
-                              int comp, int mvd_x, int mvd_y, int has_mvd) {
+                              int comp, int mvd_x, int mvd_y, int is_newmv,
+                              double frm_dist, enum BlockSize bs, int sb,
+                              int is_skip, int coded_mv_cnt) {
     double mv_x = 0.0, mv_y = 0.0;
     double mvd_len = 0.0;
     double mv_length_xy;
-    int dir_cnt = 0;
+    int count = 1;  // Default: 1 unit per MV
+#if VP_MV_POC_NORMALIZATION
+    double mvd_x_norm = 0.0, mvd_y_norm = 0.0;
+    // LEGACY BUG REPLICATION: AvMot and AvDif are integers in legacy code
+    // (VideoStatVP9.c line 198), causing truncation when dividing doubles
+    int av_mot = 1, av_dif = 1;
+
+    // Legacy mode: skip blocks go to NumBlksSkip, not NumBlksMv
+    // We don't track NumBlksSkip, but we need to NOT count them in mb_mv_count
+    if (is_skip) {
+        return;  // Skip blocks don't contribute to NumBlksMv
+    }
+
+    // Legacy mode: use block-size based counting
+    // For sub-blocks (sb >= 0): count=1 (each sub-block is one 4x4 unit)
+    // For full blocks (sb == -1): count = block_size in 4x4 units
+    if (sb == -1) {
+        // Full block - use the 4x4 count for this block size
+        count = vp9_bs_to_4x4_count[bs];
+    }
+    // Otherwise count=1 (sub-block)
+#else
+    (void)frm_dist;      // Unused in non-legacy mode
+    (void)bs;            // Unused in non-legacy mode
+    (void)sb;            // Unused in non-legacy mode
+    (void)is_skip;       // Unused in non-legacy mode
+    (void)coded_mv_cnt;  // Unused in non-legacy mode
+#endif
+
+    // Always count inter blocks (this is NumBlksMv in legacy)
+    // Legacy counts ALL non-skip inter blocks here, not just NEWMV
+    sf->mb_mv_count += count;
+
+#if VP_MV_POC_NORMALIZATION
+    // Legacy mode: only accumulate MV stats for NEWMV blocks
+    // But mb_mv_count (NumBlksMv) is used as denominator for ALL inter blocks
+    if (!is_newmv) {
+        return;  // Count was incremented above, but don't accumulate MV values
+    }
+#endif
 
     // L0 reference (always present for inter blocks)
-    dir_cnt++;
     mv_x = fabs((double)mv[0].x);
     mv_y = fabs((double)mv[0].y);
 
-    // L1 reference (compound/bi-predictive)
-    if (comp) {
-        dir_cnt++;
-        mv_x += fabs((double)mv[1].x);
-        mv_y += fabs((double)mv[1].y);
+    // Note: Legacy VP9 implementation did NOT average compound modes
+    // (the code was commented out), so we don't do it either for consistency
+    (void)comp;  // Suppress unused warning
+
+#if VP_MV_POC_NORMALIZATION
+    // Legacy normalization: divide by 8 * frame_distance
+    // The factor of 8 converts from 1/8 pel units to full pixels
+    mv_x /= (8.0 * frm_dist);
+    mv_y /= (8.0 * frm_dist);
+
+    // MVD also normalized
+    mvd_x_norm = fabs((double)mvd_x) / (8.0 * frm_dist);
+    mvd_y_norm = fabs((double)mvd_y) / (8.0 * frm_dist);
+
+    // Legacy applies 4x multiplier to MV lengths
+    if (mv_x != 0.0 || mv_y != 0.0) {
+        mv_length_xy = 4.0 * sqrt(SQR(mv_x) + SQR(mv_y));
+        mvd_len = 4.0 * sqrt(SQR(mvd_x_norm) + SQR(mvd_y_norm));
+    } else {
+        mv_length_xy = 0.0;
+        mvd_len = 0.0;
     }
 
-    // Average across directions for bi-predictive blocks
-    if (dir_cnt > 1) {
-        mv_x /= dir_cnt;
-        mv_y /= dir_cnt;
+    // LEGACY OUTLIER REJECTION: The legacy VideoStatVP9.c (ProcessMV function)
+    // rejects blocks where the normalized MV component sum exceeds 20x the
+    // running average. This computes running averages from accumulated values
+    // BEFORE adding the current block:
+    //   AvMot = MV_Length / CodedMv  (average of 4x-multiplied MV lengths)
+    //   AvDif = MV_dLength / CodedMv (average of 4x-multiplied MVD lengths)
+    // If CodedMv is 0 (first block), defaults to 1
+    // Outlier check: (abs(mvX) + abs(mvY) > 20 * AvMot) || (abs(mvdX) + abs(mvdY) > 20 * AvDif)
+    //
+    // LEGACY BUG REPLICATION: AvMot and AvDif are integers, causing truncation.
+    // Also, abs() in C is for integers - when applied to doubles it truncates first.
+    // So abs(5.7) becomes abs(5) = 5.
+    if (sf->mv_coded_count > 0) {
+        av_mot = (int)(sf->mv_length / sf->mv_coded_count);
+        av_dif = (int)(sf->mv_length_diff / sf->mv_coded_count);
+    }
+    // else av_mot and av_dif remain at 1 (legacy default)
+
+    // Check if this block is an outlier - if so, don't accumulate MV stats
+    // LEGACY BUG REPLICATION: abs() on doubles truncates to int first
+    // Legacy code: abs(mvX) + abs(mvY) > 20 * AvMot
+    // Since mvX/mvY are already positive (from fabs earlier), we just cast to int
+    if (((int)mv_x + (int)mv_y > 20 * av_mot) ||
+        ((int)mvd_x_norm + (int)mvd_y_norm > 20 * av_dif)) {
+        // Outlier detected - skip accumulation but mb_mv_count was already incremented
+        return;
     }
 
-    // Calculate magnitude
+    // Not an outlier - accumulate stats
+    // LEGACY: CodedMv += b->CodedMv[idx] * count, where b->CodedMv[idx] is
+    // the number of non-zero MV joints (0, 1, or 2 for compound mode)
+    // This is passed as coded_mv_cnt parameter
+    sf->mv_coded_count += coded_mv_cnt * count;
+
+    // Legacy accumulates values multiplied by count
+    // and squares multiplied by count*count
+    sf->mv_length += mv_length_xy * count;
+    sf->mv_sum_sqr += SQR(mv_length_xy) * count * count;
+    sf->mv_x_length += mv_x * count;
+    sf->mv_y_length += mv_y * count;
+    sf->mv_x_sum_sqr += SQR(mv_x) * count * count;
+    sf->mv_y_sum_sqr += SQR(mv_y) * count * count;
+    sf->mv_length_diff += mvd_len * count;
+    sf->mv_diff_sum_sqr += SQR(mvd_len) * count * count;
+#else
+    // Non-legacy mode: raw values without normalization
     mv_length_xy = sqrt(SQR(mv_x) + SQR(mv_y));
 
     // For diff stats, use the coded MVD if available (NEWMV mode)
-    if (has_mvd) {
+    if (is_newmv) {
         mvd_len = sqrt(SQR((double)mvd_x) + SQR((double)mvd_y));
     }
 
-    // Accumulate statistics
+    // Accumulate statistics (only for NEWMV in legacy mode, all modes otherwise)
     sf->mv_length += mv_length_xy;
     sf->mv_sum_sqr += SQR(mv_length_xy);
     sf->mv_x_length += mv_x;
@@ -87,8 +240,7 @@ static void mv_statistics_vp9(SharedFrameInfo *sf, const VP9mv *mv,
     sf->mv_y_sum_sqr += SQR(mv_y);
     sf->mv_length_diff += mvd_len;
     sf->mv_diff_sum_sqr += SQR(mvd_len);
-
-    sf->mb_mv_count++;
+#endif
 }
 
 static av_always_inline void clamp_mv(VP9mv *dst, const VP9mv *src,
@@ -359,12 +511,103 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
     // videoparser
     SharedFrameInfo *sf = videoparser_get_shared_frame_info(s->s.frames[CUR_FRAME].tf.f);
     int mvd_x = 0, mvd_y = 0;  // videoparser: track coded MVD
-    int has_mvd = 0;           // videoparser: whether MVD was coded
+    int is_newmv = 0;          // videoparser: whether this is NEWMV mode
+    double frm_dist = 1.0;     // videoparser: frame distance for legacy normalization
+    int coded_mv_cnt = 0;      // videoparser: count of non-zero MV joints (for legacy CodedMv)
+
+#if VP_MV_POC_NORMALIZATION
+    // videoparser: Calculate frame distance from PTS (legacy mode)
+    // FrmDist = max(1, (current_PTS - ref_PTS) / duration)
+    // This normalizes motion vectors by temporal distance to reference frame
+    if (mode != ZEROMV && !s->s.h.keyframe && !s->s.h.intraonly && !b->intra) {
+        AVFrame *cur_frame = s->s.frames[CUR_FRAME].tf.f;
+        int64_t frame_duration = cur_frame->duration;
+
+        if (frame_duration > 0) {
+            // Get reference frame PTS using the block's reference
+            // LEGACY BUG REPLICATION: The legacy VideoStatVP9.c used b->ref[0] DIRECTLY
+            // as an index into refs[], NOT mapping through refidx[] like the decoder does.
+            // This was a bug (mc code uses s->s.refs[s->s.h.refidx[b->ref[0]]]), but we
+            // replicate it for compatibility with legacy output.
+            // Legacy code: s->s.refs[ b->ref[0] ].f->pts (BUG: should use refidx mapping)
+            int ref_buf_idx = b->ref[0];  // Legacy bug: use ref type directly as buffer index
+            const ProgressFrame *ref_pf = &s->s.refs[ref_buf_idx];
+            if (ref_pf->f) {
+                int64_t cur_pts = cur_frame->pts;
+                int64_t ref_pts = ref_pf->f->pts;
+                double pts_diff = (double)(cur_pts - ref_pts);
+                frm_dist = pts_diff / (double)frame_duration;
+                if (frm_dist < 1.0) {
+                    frm_dist = 1.0;
+                }
+#if VP_MV_DEBUG_FRMDIST
+                // Debug: track average frm_dist per frame
+                if (cur_pts != vp9_debug_last_pts) {
+                    // New frame - print summary of previous frame
+                    if (vp9_debug_frame_count > 0 && vp9_debug_frame_count <= 30 && vp9_debug_frmdist_count > 0) {
+                        double avg_frmdist = vp9_debug_frmdist_sum / vp9_debug_frmdist_count;
+                        fprintf(stderr, "[VP9 FrmDist DEBUG] frame=%d avg_frm_dist=%.4f (from %d blocks) refs: LAST=%d GOLD=%d ALT=%d\n",
+                                vp9_debug_frame_count, avg_frmdist, vp9_debug_frmdist_count,
+                                vp9_debug_ref_count[0], vp9_debug_ref_count[1], vp9_debug_ref_count[2]);
+                    }
+                    // Reset for new frame
+                    vp9_debug_last_pts = cur_pts;
+                    vp9_debug_frame_count++;
+                    vp9_debug_frmdist_sum = 0.0;
+                    vp9_debug_frmdist_count = 0;
+                    vp9_debug_checked_init = 0;  // Reset init check flag
+                    vp9_debug_ref_count[0] = vp9_debug_ref_count[1] = vp9_debug_ref_count[2] = 0;
+                    // Print ref frame PTS for this new frame
+                    if (vp9_debug_frame_count <= 10) {
+                        int ri0 = s->s.h.refidx[0], ri1 = s->s.h.refidx[1], ri2 = s->s.h.refidx[2];
+                        fprintf(stderr, "[VP9 Refs DEBUG] frame=%d cur_pts=%"PRId64"\n",
+                                vp9_debug_frame_count, cur_pts);
+                        fprintf(stderr, "  CORRECT (via refidx): LAST[%d]=%"PRId64" GOLD[%d]=%"PRId64" ALT[%d]=%"PRId64"\n",
+                                ri0, s->s.refs[ri0].f ? s->s.refs[ri0].f->pts : -1,
+                                ri1, s->s.refs[ri1].f ? s->s.refs[ri1].f->pts : -1,
+                                ri2, s->s.refs[ri2].f ? s->s.refs[ri2].f->pts : -1);
+                        fprintf(stderr, "  LEGACY (direct idx):  refs[0]=%"PRId64" refs[1]=%"PRId64" refs[2]=%"PRId64"\n",
+                                s->s.refs[0].f ? s->s.refs[0].f->pts : -1,
+                                s->s.refs[1].f ? s->s.refs[1].f->pts : -1,
+                                s->s.refs[2].f ? s->s.refs[2].f->pts : -1);
+                    }
+                }
+                // Check SharedFrameInfo initial state (once per frame)
+                if (!vp9_debug_checked_init && vp9_debug_frame_count <= 10) {
+                    vp9_debug_checked_init = 1;
+                    fprintf(stderr, "[VP9 Init DEBUG] frame=%d mv_length=%.2f mb_mv_count=%d (SHOULD BE 0!)\n",
+                            vp9_debug_frame_count, sf->mv_length, sf->mb_mv_count);
+                }
+                // Accumulate frm_dist for this block and track reference buffer (legacy bug: used as ref type)
+                vp9_debug_frmdist_sum += frm_dist;
+                vp9_debug_frmdist_count++;
+                if (ref_buf_idx >= 0 && ref_buf_idx < 3) {
+                    vp9_debug_ref_count[ref_buf_idx]++;
+                }
+#endif
+            }
+        }
+        // If duration is 0, frm_dist stays at 1.0 (fallback)
+    }
+#endif
 
     if (mode == ZEROMV) {
         AV_ZERO32(&mv[0]);
         AV_ZERO32(&mv[1]);
-        // ZEROMV has no motion to track
+#if VP_MV_POC_NORMALIZATION
+        // videoparser: ZEROMV blocks still count as inter blocks in legacy mode
+        // They contribute to mb_mv_count but have zero motion values
+        // Note: skip blocks should NOT be counted, but at this point we don't
+        // have reliable access to skip flag for ZEROMV. The legacy code handles
+        // this differently by calling ModeStatistics after all MVs are filled.
+        // For now, we count ZEROMV blocks; this may cause slight overcounting
+        // if some ZEROMV blocks are also skip blocks.
+        if (!b->skip) {
+            int count = (sb == -1) ? vp9_bs_to_4x4_count[b->bs] : 1;
+            sf->mb_mv_count += count;
+            // ZEROMV has zero motion, so no MV accumulation needed
+        }
+#endif
     } else {
         int hp;
         int mvd_comp;  // videoparser: temporary for MVD component
@@ -396,6 +639,11 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                                                s->prob.p.mv_joint);
 
             td->counts.mv_joint[j]++;
+            // videoparser: track non-zero MV joint for legacy CodedMv calculation
+            // Legacy: b->CodedMv[idx] += (int)(j != MV_JOINT_ZERO)
+            if (j != MV_JOINT_ZERO) {
+                coded_mv_cnt++;
+            }
             if (j >= MV_JOINT_V) {
                 mvd_comp = read_mv_component(td, 0, hp);
                 mv[0].y += mvd_comp;
@@ -408,8 +656,12 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
             }
             // videoparser: accumulate motion bits
             sf->motion_bit_count += td->c->bit_count;
+#if !VP_MV_POC_NORMALIZATION
+            // In legacy mode, mv_coded_count is handled in mv_statistics_vp9()
+            // with outlier rejection and weighted counting
             sf->mv_coded_count++;
-            has_mvd = 1;
+#endif
+            is_newmv = 1;  // videoparser: mark as NEWMV mode
         }
 
         if (b->comp) {
@@ -439,6 +691,11 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                                                    s->prob.p.mv_joint);
 
                 td->counts.mv_joint[j]++;
+                // videoparser: track non-zero MV joint for legacy CodedMv calculation
+                // Legacy: b->CodedMv[idx] += (int)(j != MV_JOINT_ZERO)
+                if (j != MV_JOINT_ZERO) {
+                    coded_mv_cnt++;
+                }
                 if (j >= MV_JOINT_V) {
                     mvd_comp = read_mv_component(td, 0, hp);
                     mv[1].y += mvd_comp;
@@ -451,11 +708,16 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                 }
                 // videoparser: accumulate motion bits
                 sf->motion_bit_count += td->c->bit_count;
+#if !VP_MV_POC_NORMALIZATION
+                // In legacy mode, mv_coded_count is handled in mv_statistics_vp9()
+                // with outlier rejection and weighted counting
                 sf->mv_coded_count++;
+#endif
             }
         }
 
         // videoparser: accumulate MV statistics for inter blocks
-        mv_statistics_vp9(sf, mv, b->comp, mvd_x, mvd_y, has_mvd);
+        // Pass block size, sub-block index, skip flag, and coded_mv_cnt for proper counting in legacy mode
+        mv_statistics_vp9(sf, mv, b->comp, mvd_x, mvd_y, is_newmv, frm_dist, b->bs, sb, b->skip, coded_mv_cnt);
     }
 }
