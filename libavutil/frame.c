@@ -99,6 +99,12 @@ static SharedFrameInfo *videoparser_init_shared_frame_info(AVFrame *frame) {
     sf->mb_mv_count = 0;
     sf->mv_coded_count = 0;
 
+    // VP9 hidden frame handling
+    sf->is_hidden = 0;
+    sf->is_short_frame = 0;
+    sf->frame_distance = 0;
+    sf->pts = 0;
+
     return sf;
 }
 
