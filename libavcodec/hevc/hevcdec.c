@@ -2749,7 +2749,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
     }
 
     if (SAMPLE_CTB(l->skip_flag, x_cb, y_cb)) {
-        hls_prediction_unit(lc, (HEVCLayerContext *) l, pps, sps,
+        hls_prediction_unit(lc, l, pps, sps,
                             x0, y0, cb_size, cb_size, log2_cb_size, 0, idx);
         intra_prediction_unit_default_value(lc, l, sps, x0, y0, log2_cb_size);
 
@@ -3035,7 +3035,7 @@ static void hls_decode_neighbour(HEVCLocalContext *lc,
 static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
 {
     HEVCLocalContext *const lc = &s->local_ctx[0];
-    HEVCLayerContext *const l = &s->layers[s->cur_layer];
+    const HEVCLayerContext *const l = &s->layers[s->cur_layer];
     const HEVCPPS   *const pps = s->pps;
     const HEVCSPS   *const sps = pps->sps;
     const uint8_t *slice_data = gb->buffer + s->sh.data_offset;
