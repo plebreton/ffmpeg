@@ -445,6 +445,9 @@ typedef struct HEVCLocalContext {
      * of the deblocking filter */
     int boundary_flags;
 
+    // address (in raster order) of the current CTB, used for CABAC context initialization and SAO
+    int current_ctb_addr_rs;
+
     // an array of these structs is used for per-thread state - pad its size
     // to avoid false sharing
     char padding[128];
@@ -486,6 +489,11 @@ typedef struct HEVCLayerContext {
 
     struct AVRefStructPool *tab_mvf_pool;
     struct AVRefStructPool *rpl_tab_pool;
+
+
+    uint32_t                *ctu_motion_bits;
+    uint32_t                *ctu_coeff_bits;
+    uint32_t                *ctu_total_bits;
 } HEVCLayerContext;
 
 typedef struct HEVCContext {
@@ -591,6 +599,14 @@ typedef struct HEVCContext {
     int vp_prev_poc;            ///< POC of the previous frame
     int vp_poc_diff;            ///< Smallest POC difference per frame so far; -1 if not yet known
     int64_t vp_prev_pts;        ///< PTS of the previous frame
+    // variables for dumping motion vectors and QP values for each CTB, for analysis purposes
+    char *qp_export_path;
+    FILE *qp_export_file;
+    char *mv_export_path;
+    FILE *mv_export_file;
+    char *ctu_bits_export_path;
+    FILE *ctu_bits_export_file;
+
 } HEVCContext;
 
 /**
@@ -742,6 +758,14 @@ int ff_hevc_is_alpha_video(const HEVCContext *s);
  */
 int ff_hevc_requested_layers(const HEVCContext *s, const HEVCVPS *vps,
                              unsigned *active_output);
+static int export_qp_matrix(HEVCContext *s, HEVCLayerContext *l);
+static int export_mv_matrix(HEVCContext *s);
+static int export_ctu_bits_matrix(HEVCContext *s, HEVCLayerContext *l);
+
+static av_always_inline void export_ctu_bits(HEVCContext *s, HEVCLocalContext *lc,
+                                             HEVCLayerContext *l,
+                                             uint32_t motion_bits,
+                                             uint32_t coeff_bits);
 
 extern const uint8_t ff_hevc_qpel_extra_before[4];
 extern const uint8_t ff_hevc_qpel_extra_after[4];

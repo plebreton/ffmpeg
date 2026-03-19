@@ -59,6 +59,11 @@
 #include "parse.h"
 #include "hevcdec.h"
 
+
+
+
+
+
 static const uint8_t hevc_pel_weight[65] = { [2] = 0, [4] = 1, [6] = 2, [8] = 3, [12] = 4, [16] = 5, [24] = 6, [32] = 7, [48] = 8, [64] = 9 };
 
 /**
@@ -90,6 +95,10 @@ static void pic_arrays_free(HEVCLayerContext *l)
     av_freep(&l->horizontal_bs);
     av_freep(&l->vertical_bs);
 
+    av_freep(&l->ctu_motion_bits);
+    av_freep(&l->ctu_coeff_bits);
+    av_freep(&l->ctu_total_bits);
+
     for (int i = 0; i < 3; i++) {
         av_freep(&l->sao_pixel_buffer_h[i]);
         av_freep(&l->sao_pixel_buffer_v[i]);
@@ -118,7 +127,7 @@ static int pic_arrays_init(HEVCLayerContext *l, const HEVCSPS *sps)
     if (!l->sao || !l->deblock)
         goto fail;
 
-    l->skip_flag    = av_malloc_array(sps->min_cb_height, sps->min_cb_width);
+    l->skip_flag    = av_calloc(sps->min_cb_height, sps->min_cb_width);
     l->tab_ct_depth = av_malloc_array(sps->min_cb_height, sps->min_cb_width);
     if (!l->skip_flag || !l->tab_ct_depth)
         goto fail;
@@ -164,6 +173,12 @@ static int pic_arrays_init(HEVCLayerContext *l, const HEVCSPS *sps)
                 goto fail;
         }
     }
+
+    l->ctu_motion_bits = av_calloc(ctb_count, sizeof(*l->ctu_motion_bits));
+    l->ctu_coeff_bits  = av_calloc(ctb_count, sizeof(*l->ctu_coeff_bits));
+    l->ctu_total_bits  = av_calloc(ctb_count, sizeof(*l->ctu_total_bits));
+    if (!l->ctu_motion_bits || !l->ctu_coeff_bits || !l->ctu_total_bits)
+        goto fail;
 
     return 0;
 
@@ -1333,7 +1348,7 @@ static int hls_transform_unit(HEVCLocalContext *lc,
     int i;
 
     // videoparser
-    SharedFrameInfo *sf;
+    // SharedFrameInfo *sf;
     lc->cc.bit_count = 0;
 
     if (lc->cu.pred_mode == MODE_INTRA) {
@@ -1533,8 +1548,9 @@ static int hls_transform_unit(HEVCLocalContext *lc,
         }
     }
 
-    sf = videoparser_get_shared_frame_info(lc->parent->cur_frame->f);
-    sf->coefs_bit_count += lc->cc.bit_count;
+    // sf = videoparser_get_shared_frame_info(lc->parent->cur_frame->f);
+    // sf->coefs_bit_count += lc->cc.bit_count;
+    export_ctu_bits((HEVCContext*) s, lc, (HEVCLayerContext*) l, 0, lc->cc.bit_count);
     return 0;
 }
 
@@ -2157,7 +2173,7 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
     int skip_flag = SAMPLE_CTB(l->skip_flag, x_cb, y_cb);
 
     // videoparser
-    SharedFrameInfo *sf;
+    // SharedFrameInfo *sf;
     lc->cc.bit_count = 0;
 
     if (!skip_flag)
@@ -2177,8 +2193,10 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
     }
 
     // videoparser
-    sf = videoparser_get_shared_frame_info(lc->parent->cur_frame->f);
-    sf->motion_bit_count += lc->cc.bit_count;
+    // sf = videoparser_get_shared_frame_info(lc->parent->cur_frame->f);
+    // sf->motion_bit_count += lc->cc.bit_count;
+    export_ctu_bits((HEVCContext *) s, lc, (HEVCLayerContext *) l, lc->cc.bit_count, 0);
+
 
     x_pu = x0 >> sps->log2_min_pu_size;
     y_pu = y0 >> sps->log2_min_pu_size;
@@ -2731,7 +2749,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
     }
 
     if (SAMPLE_CTB(l->skip_flag, x_cb, y_cb)) {
-        hls_prediction_unit(lc, l, pps, sps,
+        hls_prediction_unit(lc, (HEVCLayerContext *) l, pps, sps,
                             x0, y0, cb_size, cb_size, log2_cb_size, 0, idx);
         intra_prediction_unit_default_value(lc, l, sps, x0, y0, log2_cb_size);
 
@@ -3017,7 +3035,7 @@ static void hls_decode_neighbour(HEVCLocalContext *lc,
 static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
 {
     HEVCLocalContext *const lc = &s->local_ctx[0];
-    const HEVCLayerContext *const l = &s->layers[s->cur_layer];
+    HEVCLayerContext *const l = &s->layers[s->cur_layer];
     const HEVCPPS   *const pps = s->pps;
     const HEVCSPS   *const sps = pps->sps;
     const uint8_t *slice_data = gb->buffer + s->sh.data_offset;
@@ -3029,8 +3047,14 @@ static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
     int ctb_addr_ts = pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs];
     int ret;
 
+    
     while (more_data && ctb_addr_ts < sps->ctb_size) {
         int ctb_addr_rs = pps->ctb_addr_ts_to_rs[ctb_addr_ts];
+
+        lc->current_ctb_addr_rs = ctb_addr_ts;
+        l->ctu_motion_bits[ctb_addr_rs] = 0;
+        l->ctu_coeff_bits[ctb_addr_rs]  = 0;
+        l->ctu_total_bits[ctb_addr_rs]  = 0;
 
         x_ctb = (ctb_addr_rs % ((sps->width + ctb_size - 1) >> sps->log2_ctb_size)) << sps->log2_ctb_size;
         y_ctb = (ctb_addr_rs / ((sps->width + ctb_size - 1) >> sps->log2_ctb_size)) << sps->log2_ctb_size;
@@ -3065,6 +3089,21 @@ static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
         y_ctb + ctb_size >= sps->height)
         ff_hevc_hls_filter(lc, l, pps, x_ctb, y_ctb, ctb_size);
 
+    if (s->qp_export_file) {
+        HEVCLayerContext *l = &s->layers[s->cur_layer];
+        int res_w = export_qp_matrix(s, l);
+        if (res_w < 0)
+            return res_w;
+    }
+
+    if (s->ctu_bits_export_file) {
+        HEVCLayerContext *l = &s->layers[s->cur_layer];
+        int res_w = export_ctu_bits_matrix(s, l);
+        if (res_w < 0)
+            return res_w;
+    }
+
+    lc->current_ctb_addr_rs = -1;
     return ctb_addr_ts;
 }
 
@@ -3288,6 +3327,22 @@ static int hls_slice_data_wpp(HEVCContext *s, const H2645NAL *nal)
         res += ret[i];
 
     av_free(ret);
+
+    if (s->qp_export_file) {
+        HEVCLayerContext *l = &s->layers[s->cur_layer];
+        int ret_w = export_qp_matrix(s, l);
+        if (ret_w < 0)
+            return ret_w;
+    }
+
+    if (s->ctu_bits_export_file) {
+        HEVCLayerContext *l = &s->layers[s->cur_layer];
+        int ret_w = export_ctu_bits_matrix(s, l);
+        if (ret_w < 0)
+            return ret_w;
+    }
+
+
     return res;
 }
 
@@ -3436,6 +3491,14 @@ static int set_side_data(HEVCContext *s)
                                     AV_FRAME_SIDE_DATA_FLAG_NEW_REF))
             return AVERROR(ENOMEM);
     }
+
+
+    if(s->mv_export_file) {
+        ret = export_mv_matrix(s);
+        if (ret < 0)
+            return ret;
+    }
+
 
     return 0;
 }
@@ -4343,6 +4406,24 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
 
     ff_hevc_reset_sei(&s->sei);
 
+    if (s->qp_export_file) {
+        fclose(s->qp_export_file);
+        s->qp_export_file = NULL;
+    }
+    av_freep(&s->qp_export_path);
+
+    if (s->mv_export_file) {
+        fclose(s->mv_export_file);
+        s->mv_export_file = NULL;
+    }
+    av_freep(&s->mv_export_path);
+
+    if (s->ctu_bits_export_file) {
+        fclose(s->ctu_bits_export_file);
+        s->ctu_bits_export_file = NULL;
+    }
+    av_freep(&s->ctu_bits_export_path);
+
     return 0;
 }
 
@@ -4570,8 +4651,193 @@ static av_cold int hevc_decode_init(AVCodecContext *avctx)
             s->dovi_ctx.cfg = *(AVDOVIDecoderConfigurationRecord *) sd->data;
     }
 
+
+
+    // getting prepared to dump data
+    if (s->qp_export_path) {
+        s->qp_export_file = fopen(s->qp_export_path, "wb");
+        if (!s->qp_export_file)
+            return AVERROR(errno);
+    }
+
+    if (s->mv_export_path) {
+        s->mv_export_file = fopen(s->mv_export_path, "wb");
+        if (!s->mv_export_file)
+            return AVERROR(errno);
+    }
+
+    s->local_ctx[0].current_ctb_addr_rs = -1;
+    if (s->ctu_bits_export_path) {
+        s->ctu_bits_export_file = fopen(s->ctu_bits_export_path, "wb");
+        if (!s->ctu_bits_export_file)
+            return AVERROR(errno);
+    }
+
     return 0;
 }
+
+static int export_qp_matrix(HEVCContext *s, HEVCLayerContext *l)
+{
+    
+    const HEVCSPS *sps = s->cur_frame->pps->sps;
+    const int w = sps->min_cb_width;
+    const int h = sps->min_cb_height;
+
+    if (!s->qp_export_file)
+        return 0;
+
+    int32_t header[3];
+    header[0] = s->sh.poc;   // or your own frame counter
+    header[1] = w;
+    header[2] = h;
+
+    if (fwrite(header, sizeof(header[0]), 3, s->qp_export_file) != 3)
+        return AVERROR(EIO);
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const int idx = y * w + x;
+            int16_t v = l->skip_flag[idx] ? -1 : (int16_t)l->qp_y_tab[idx];
+            if (fwrite(&v, sizeof(v), 1, s->qp_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+} 
+
+
+typedef struct MVCellOut {
+    int16_t mv_l0_x;
+    int16_t mv_l0_y;
+    int16_t mv_l1_x;
+    int16_t mv_l1_y;
+    int8_t  ref_idx_l0;
+    int8_t  ref_idx_l1;
+    int8_t  pred_flag;
+    int8_t  reserved;
+} MVCellOut;
+
+
+static int export_mv_matrix(HEVCContext *s)
+{ 
+    const HEVCSPS *sps = s->cur_frame->pps->sps;
+    const int w = sps->min_pu_width;
+    const int h = sps->min_pu_height;
+    const MvField *tab_mvf = s->cur_frame->tab_mvf;
+    int32_t header[3];
+    int x, y;
+
+    if (!s->mv_export_file || !s->cur_frame || !tab_mvf)
+        return 0;
+
+    header[0] = s->sh.poc;   // or your own frame counter if available
+    header[1] = w;
+    header[2] = h;
+
+    if (fwrite(header, sizeof(header[0]), 3, s->mv_export_file) != 3)
+        return AVERROR(EIO);
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            const MvField *mvf = &tab_mvf[y * w + x];
+            MVCellOut out;
+
+            out.mv_l0_x = out.mv_l0_y = -32768;
+            out.mv_l1_x = out.mv_l1_y = -32768;
+            out.ref_idx_l0 = -1;
+            out.ref_idx_l1 = -1;
+            out.pred_flag  = mvf->pred_flag;
+            out.reserved   = 0;
+
+            if (mvf->pred_flag != PF_INTRA) {
+                if (mvf->pred_flag & PF_L0) {
+                    out.mv_l0_x = mvf->mv[0].x;
+                    out.mv_l0_y = mvf->mv[0].y;
+                    out.ref_idx_l0 = mvf->ref_idx[0];
+                }
+                if (mvf->pred_flag & PF_L1) {
+                    out.mv_l1_x = mvf->mv[1].x;
+                    out.mv_l1_y = mvf->mv[1].y;
+                    out.ref_idx_l1 = mvf->ref_idx[1];
+                }
+            }
+ 
+            if (fwrite(&out, sizeof(out), 1, s->mv_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+}
+
+typedef struct CTUBitsCell {
+    uint32_t total_bits;
+    uint32_t motion_bits;
+    uint32_t coeff_bits;
+} CTUBitsCell;
+
+static av_always_inline void export_ctu_bits(HEVCContext *s, HEVCLocalContext *lc,
+                                             HEVCLayerContext *l,
+                                             uint32_t motion_bits,
+                                             uint32_t coeff_bits)
+{
+    SharedFrameInfo *fi;
+    const int idx = lc->current_ctb_addr_rs;
+
+    if (idx < 0)
+        return;
+
+    l->ctu_motion_bits[idx] += motion_bits;
+    l->ctu_coeff_bits[idx]  += coeff_bits;
+    l->ctu_total_bits[idx]  += motion_bits + coeff_bits;
+
+    fi = videoparser_get_shared_frame_info(s->cur_frame->f);
+    if (!fi)
+        return;
+
+    fi->motion_bit_count += motion_bits;
+    fi->coefs_bit_count  += coeff_bits;
+}
+
+
+static int export_ctu_bits_matrix(HEVCContext *s, HEVCLayerContext *l)
+{
+    const HEVCSPS *sps;
+    int32_t header[4];
+
+    if (!s->ctu_bits_export_file || !s->cur_frame || !s->cur_frame->pps)
+        return 0;
+
+    sps = s->cur_frame->pps->sps;
+
+    header[0] = s->poc;
+    header[1] = sps->ctb_width;
+    header[2] = sps->ctb_height;
+    header[3] = 1 << sps->log2_ctb_size;
+
+    if (fwrite(header, sizeof(header[0]), 4, s->ctu_bits_export_file) != 4)
+        return AVERROR(EIO);
+
+    for (int y = 0; y < sps->ctb_height; y++) {
+        for (int x = 0; x < sps->ctb_width; x++) {
+            const int idx = y * sps->ctb_width + x;
+            CTUBitsCell out;
+
+            out.total_bits  = l->ctu_total_bits[idx];
+            out.motion_bits = l->ctu_motion_bits[idx];
+            out.coeff_bits  = l->ctu_coeff_bits[idx];
+
+            if (fwrite(&out, sizeof(out), 1, s->ctu_bits_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+}
+
+
+
 
 static av_cold void hevc_decode_flush(AVCodecContext *avctx)
 {
@@ -4607,7 +4873,9 @@ static const AVOption options[] = {
         { "unspecified", .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_UNSPEC }, .unit = "view_pos" },
         { "left",        .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_LEFT },   .unit = "view_pos" },
         { "right",       .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_RIGHT },  .unit = "view_pos" },
-
+    { "export_qp_matrix", "Write per-frame HEVC QP matrices to a binary file", OFFSET(qp_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, PAR },
+    { "export_mv_matrix", "Write per-frame HEVC motion-vector matrix to a binary file", OFFSET(mv_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, PAR },
+    { "export_ctu_bits_matrix", "Write per-frame CTU bit counts to a binary file", OFFSET(ctu_bits_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, PAR },
     { NULL },
 };
 
