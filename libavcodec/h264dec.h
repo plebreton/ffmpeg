@@ -592,6 +592,24 @@ typedef struct H264Context {
     int vp_prev_poc;                    ///< POC of the previous slice
     int vp_poc_diff;                    ///< Smallest POC difference per frame so far; -1 if not yet known
     int64_t vp_prev_pts;                ///< PTS of the previous slice
+    // add the data to export the qp values for each macroblock to a file, for debugging and analysis purposes
+    int64_t qp_export_frame_counter;
+    char *qp_export_path;
+    FILE *qp_export_file;
+
+    int64_t mv_export_frame_counter;
+    char *mv_export_path;
+    FILE *mv_export_file;
+
+    char *mb_bits_export_path;
+    FILE *mb_bits_export_file;
+
+    uint32_t *mb_total_bits;
+    uint32_t *mb_motion_bits;
+    uint32_t *mb_coeff_bits;
+    int mb_bits_array_size;
+
+    int64_t mb_bits_export_frame_counter;
 } H264Context;
 
 extern const uint16_t ff_h264_mb_sizes[4];
@@ -738,5 +756,24 @@ void ff_h264_flush_change(H264Context *h);
 void ff_h264_free_tables(H264Context *h);
 
 void ff_h264_set_erpic(ERPicture *dst, const H264Picture *src);
+
+
+static av_always_inline void export_mb_bits(H264Context *h, H264SliceContext *sl,
+                                            uint32_t motion_bits,
+                                            uint32_t coeff_bits,
+                                            uint32_t total_bits)
+{
+    const int idx = sl->mb_xy;
+
+    if (!h->mb_total_bits || !h->mb_motion_bits || !h->mb_coeff_bits)
+        return;
+    if (idx < 0 || idx >= h->mb_bits_array_size)
+        return;
+
+    h->mb_motion_bits[idx] += motion_bits;
+    h->mb_coeff_bits[idx]  += coeff_bits;
+    h->mb_total_bits[idx]  += total_bits;
+}
+
 
 #endif /* AVCODEC_H264DEC_H */

@@ -1941,9 +1941,17 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
 
     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y * h->mb_stride;
 
+    uint32_t motion_bits = 0;
+    uint32_t coeff_bits  = 0;
+    uint32_t total_bits  = 0;
+
+
     ff_tlog(h->avctx, "pic:%d mb:%d/%d\n", h->poc.frame_num, sl->mb_x, sl->mb_y);
     if (sl->slice_type_nos != AV_PICTURE_TYPE_I) {
         int skip;
+
+        sl->cabac.bit_count = 0;
+
         /* a skipped mb needs the aff flag from the following mb */
         if (FRAME_MBAFF(h) && (sl->mb_y & 1) == 1 && sl->prev_mb_skipped)
             skip = sl->next_mb_skipped;
@@ -1963,6 +1971,11 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
             h->cbp_table[mb_xy] = 0;
             h->chroma_pred_mode_table[mb_xy] = 0;
             sl->last_qscale_diff = 0;
+
+            motion_bits = sl->cabac.bit_count;
+            total_bits  = motion_bits;
+            export_mb_bits((H264Context *)h, sl, motion_bits, 0, total_bits);
+
 
             return 0;
 
@@ -2446,6 +2459,7 @@ decode_intra_mb:
             scan    = sl->qscale ? h->zigzag_scan : h->zigzag_scan_q0;
         }
 
+        motion_bits = sl->cabac.bit_count;
         sl->cabac.bit_count = 0; // videoparser
         decode_cabac_luma_residual(h, sl, scan, scan8x8, pixel_shift, mb_type, cbp, 0);
         if (CHROMA444(h)) {
@@ -2506,6 +2520,10 @@ decode_intra_mb:
         sl->last_qscale_diff = 0;
     }
 
+    coeff_bits = sl->cabac.bit_count;
+    total_bits = motion_bits + coeff_bits;
+    export_mb_bits((H264Context *)h, sl, motion_bits, coeff_bits, total_bits);
+    
     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
     // videoparser
     sf = videoparser_get_shared_frame_info(h->cur_pic_ptr->f);

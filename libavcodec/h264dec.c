@@ -157,6 +157,12 @@ void ff_h264_free_tables(H264Context *h)
     av_freep(&h->mb2b_xy);
     av_freep(&h->mb2br_xy);
 
+    // these arrays are for tracking the number of bits
+    av_freep(&h->mb_total_bits);
+    av_freep(&h->mb_motion_bits);
+    av_freep(&h->mb_coeff_bits);
+    h->mb_bits_array_size = 0;
+
     av_refstruct_pool_uninit(&h->qscale_table_pool);
     av_refstruct_pool_uninit(&h->mb_type_pool);
     av_refstruct_pool_uninit(&h->motion_val_pool);
@@ -190,20 +196,28 @@ int ff_h264_alloc_tables(H264Context *h)
     const int big_mb_num = h->mb_stride * (h->mb_height + 1);
     const int row_mb_num = 2*h->mb_stride*FFMAX(h->nb_slice_ctx, 1);
     const int st_size = big_mb_num + h->mb_stride;
+    const int mb_array_size = h->mb_height * h->mb_stride;
     int x, y;
 
+
+
     if (!FF_ALLOCZ_TYPED_ARRAY(h->intra4x4_pred_mode,     row_mb_num * 8)  ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->non_zero_count,         big_mb_num)      ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->slice_table_base,       st_size)         ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->cbp_table,              big_mb_num)      ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->chroma_pred_mode_table, big_mb_num)      ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[0],           row_mb_num * 8)  ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[1],           row_mb_num * 8)  ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->direct_table,           big_mb_num * 4)  ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->list_counts,            big_mb_num)      ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->mb2b_xy,                big_mb_num)      ||
-        !FF_ALLOCZ_TYPED_ARRAY(h->mb2br_xy,               big_mb_num))
-        return AVERROR(ENOMEM);
+    !FF_ALLOCZ_TYPED_ARRAY(h->non_zero_count,         big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->slice_table_base,       st_size)         ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->cbp_table,              big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->chroma_pred_mode_table, big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[0],           row_mb_num * 8)  ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[1],           row_mb_num * 8)  ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->direct_table,           big_mb_num * 4)  ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->list_counts,            big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mb2b_xy,                big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mb2br_xy,               big_mb_num)      ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mb_total_bits,          mb_array_size)   ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mb_motion_bits,         mb_array_size)   ||
+    !FF_ALLOCZ_TYPED_ARRAY(h->mb_coeff_bits,          mb_array_size))
+    return AVERROR(ENOMEM);
+
+    h->mb_bits_array_size = mb_array_size;
     h->slice_ctx[0].intra4x4_pred_mode = h->intra4x4_pred_mode;
     h->slice_ctx[0].mvd_table[0] = h->mvd_table[0];
     h->slice_ctx[0].mvd_table[1] = h->mvd_table[1];
@@ -381,8 +395,168 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     h264_free_pic(h, &h->cur_pic);
     h264_free_pic(h, &h->last_pic_for_ec);
 
+    // close the file for logging out the qp values for each macroblock if it was opened
+    if (h->qp_export_file) {
+        fclose(h->qp_export_file);
+        h->qp_export_file = NULL;
+    }
+
+    if (h->mv_export_file) {
+        fclose(h->mv_export_file);
+        h->mv_export_file = NULL;
+    }
+
+    if (h->mb_bits_export_file) {
+        fclose(h->mb_bits_export_file);
+        h->mb_bits_export_file = NULL;
+    }
+
     return 0;
 }
+
+static int export_qp_matrix_avc(H264Context *h, const H264Picture *p)
+{
+    const int w = p->mb_width;
+    const int hgt = p->mb_height;
+
+    if (!h->qp_export_file || !p->qscale_table)
+        return 0;
+
+    int32_t header[3];
+    header[0] = h->qp_export_frame_counter++;   // or p->frame_num / POC-like value if you prefer
+    header[1] = w;
+    header[2] = hgt;
+
+    if (fwrite(header, sizeof(header[0]), 3, h->qp_export_file) != 3)
+        return AVERROR(EIO);
+
+    for (int y = 0; y < hgt; y++) {
+        for (int x = 0; x < w; x++) {
+            const int mb_xy = y * p->mb_stride + x;
+            int16_t v = (int16_t)p->qscale_table[mb_xy];
+            if (fwrite(&v, sizeof(v), 1, h->qp_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+}
+
+
+typedef struct MVCellOut {
+    int16_t mv_l0_x;
+    int16_t mv_l0_y;
+    int16_t mv_l1_x;
+    int16_t mv_l1_y;
+    int8_t  ref_idx_l0;
+    int8_t  ref_idx_l1;
+    int8_t  pred_flag;
+    int8_t  reserved;
+} MVCellOut;
+
+static int export_mv_matrix_avc(H264Context *h, const H264Picture *p)
+{
+    const int w = p->mb_width * 4;
+    const int hgt = p->mb_height * 4;
+    int32_t header[3];
+
+    if (!h->mv_export_file || !p)
+        return 0;
+
+    header[0] = h->mv_export_frame_counter++;  // or your own frame counter
+    header[1] = w;
+    header[2] = hgt;
+
+    if (fwrite(header, sizeof(header[0]), 3, h->mv_export_file) != 3)
+        return AVERROR(EIO);
+
+    for (int y = 0; y < hgt; y++) {
+        for (int x = 0; x < w; x++) {
+            const int mb_x   = x >> 2;
+            const int mb_y   = y >> 2;
+            const int mb_xy  = mb_y * p->mb_stride + mb_x;
+            const int b_xy   = y * 4 * p->mb_stride + x;                 // 4x4 MV grid
+            const int ref_xy = (y >> 1) * (2 * p->mb_stride) + (x >> 1); // 8x8 ref grid
+
+            
+            MVCellOut out;
+
+            out.mv_l0_x = out.mv_l0_y = -32768;
+            out.mv_l1_x = out.mv_l1_y = -32768;
+            out.ref_idx_l0 = -1;
+            out.ref_idx_l1 = -1;
+            out.pred_flag  = 0;
+            out.reserved   = 0;
+
+            if (!IS_INTRA(p->mb_type[mb_xy])) {
+                if (p->motion_val[0] && p->ref_index[0]) {
+                    const int ref0 = p->ref_index[0][ref_xy];
+                    if (ref0 >= 0) {
+                        out.mv_l0_x = p->motion_val[0][b_xy][0];
+                        out.mv_l0_y = p->motion_val[0][b_xy][1];
+                        out.ref_idx_l0 = ref0;
+                        out.pred_flag |= 1;
+                    }
+                }
+
+                if (p->motion_val[1] && p->ref_index[1]) {
+                    const int ref1 = p->ref_index[1][ref_xy];
+                    if (ref1 >= 0) {
+                        out.mv_l1_x = p->motion_val[1][b_xy][0];
+                        out.mv_l1_y = p->motion_val[1][b_xy][1];
+                        out.ref_idx_l1 = ref1;
+                        out.pred_flag |= 2;
+                    }
+                }
+            }
+
+            if (fwrite(&out, sizeof(out), 1, h->mv_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+}
+
+typedef struct MBBitsCell {
+    uint32_t total_bits;
+    uint32_t motion_bits;
+    uint32_t coeff_bits;
+} MBBitsCell;
+
+static int export_mb_bits_matrix(H264Context *h, const H264Picture *p)
+{
+    int32_t header[4];
+
+    if (!h->mb_bits_export_file || !p)
+        return 0;
+
+    header[0] = h->mb_bits_export_frame_counter++;
+    header[1] = p->mb_width;
+    header[2] = p->mb_height;
+    header[3] = 16;
+
+    if (fwrite(header, sizeof(header[0]), 4, h->mb_bits_export_file) != 4)
+        return AVERROR(EIO);
+
+    for (int y = 0; y < p->mb_height; y++) {
+        for (int x = 0; x < p->mb_width; x++) {
+            const int idx = y * p->mb_stride + x;
+            MBBitsCell out;
+
+            out.total_bits  = h->mb_total_bits[idx];
+            out.motion_bits = h->mb_motion_bits[idx];
+            out.coeff_bits  = h->mb_coeff_bits[idx];
+
+            if (fwrite(&out, sizeof(out), 1, h->mb_bits_export_file) != 1)
+                return AVERROR(EIO);
+        }
+    }
+
+    return 0;
+}
+
+
 
 static AVOnce h264_vlc_init = AV_ONCE_INIT;
 
@@ -433,6 +607,29 @@ static av_cold int h264_decode_init(AVCodecContext *avctx)
                "Error resilience with slice threads is enabled. It is unsafe and unsupported and may crash. "
                "Use it at your own risk\n");
     }
+
+        // getting prepared to dump data
+    if (h->qp_export_path) {
+        h->qp_export_frame_counter = 0;
+        h->qp_export_file = fopen(h->qp_export_path, "wb");
+        if (!h->qp_export_file)
+            return AVERROR(errno);
+    }
+
+    if (h->mv_export_path) {
+        h->mv_export_frame_counter = 0;
+        h->mv_export_file = fopen(h->mv_export_path, "wb");
+        if (!h->mv_export_file)
+            return AVERROR(errno);
+    }
+
+    if(h->mb_bits_export_path) {
+        h->mb_bits_export_frame_counter = 0;
+        h->mb_bits_export_file = fopen(h->mb_bits_export_path, "wb");
+        if (!h->mb_bits_export_file)
+            return AVERROR(errno);
+    }
+
 
     return 0;
 }
@@ -947,6 +1144,26 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
     if (!(h->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
         av_frame_remove_side_data(dst, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
+    // export the QP matrix for debugging and analysis purposes
+    export_qp_matrix_avc(h, srcp);
+
+    // export the motion vectors
+    ret = export_mv_matrix_avc(h, srcp);
+    if (ret < 0)
+        return ret;
+
+    // export the MB bits
+    ret = export_mb_bits_matrix(h, srcp);
+    if (ret < 0)
+        return ret;
+
+    if (h->mb_total_bits) {
+        memset(h->mb_total_bits,  0, h->mb_bits_array_size * sizeof(*h->mb_total_bits));
+        memset(h->mb_motion_bits, 0, h->mb_bits_array_size * sizeof(*h->mb_motion_bits));
+        memset(h->mb_coeff_bits,  0, h->mb_bits_array_size * sizeof(*h->mb_coeff_bits));
+    }
+
+
     return 0;
 fail:
     av_frame_unref(dst);
@@ -1153,6 +1370,9 @@ static const AVOption h264_options[] = {
     { "x264_build", "Assume this x264 version if no x264 version found in any SEI", OFFSET(x264_build), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VD },
     { "skip_gray", "Do not return gray gap frames", OFFSET(skip_gray), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "noref_gray", "Avoid using gray gap frames as references", OFFSET(noref_gray), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+    { "export_qp_matrix", "Write per-frame AVC MB QP matrices to a binary file", OFFSET(qp_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_mv_matrix", "Write per-frame AVC motion-vector matrix to a binary file", OFFSET(mv_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_ctu_bits_matrix", "Write per-frame CTU bit counts to a binary file", OFFSET(mb_bits_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { NULL },
 };
 

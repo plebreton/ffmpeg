@@ -698,6 +698,12 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
     const int pixel_shift = h->pixel_shift;
 
     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y*h->mb_stride;
+    int total_start_bits  = get_bits_count(&sl->gb);
+    int motion_start_bits = total_start_bits;
+    int motion_end_bits   = total_start_bits;
+    int coeff_start_bits  = -1;
+    int coeff_end_bits    = -1;
+
     memset(sl->mvd_cache, 0, sizeof(sl->mvd_cache)); // videoparser: Clear motion vector cache for the current macroblock
 
     ff_tlog(h->avctx, "pic:%d mb:%d/%d\n", h->poc.frame_num, sl->mb_x, sl->mb_y);
@@ -719,6 +725,12 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
                     sl->mb_mbaff = sl->mb_field_decoding_flag = get_bits1(&sl->gb);
             }
             decode_mb_skip(h, sl);
+
+            export_mb_bits((H264Context *)h, sl,
+                   get_bits_count(&sl->gb) - motion_start_bits,
+                   0,
+                   get_bits_count(&sl->gb) - total_start_bits);
+
             return 0;
         }
     }
@@ -1159,6 +1171,9 @@ decode_intra_mb:
             scan    = sl->qscale ? h->zigzag_scan : h->zigzag_scan_q0;
         }
 
+        motion_end_bits = get_bits_count(&sl->gb);
+        coeff_start_bits = motion_end_bits;
+
         if ((ret = decode_luma_residual(h, sl, gb, scan, scan8x8, pixel_shift, mb_type, cbp, 0)) < 0 ) {
             return -1;
         }
@@ -1208,6 +1223,19 @@ decode_intra_mb:
     }
     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
     write_back_non_zero_count(h, sl);
+
+    {
+        int total_end_bits = get_bits_count(&sl->gb);
+
+        if (coeff_start_bits < 0)
+            coeff_start_bits = total_end_bits;
+        coeff_end_bits = total_end_bits;
+
+        export_mb_bits((H264Context *)h, sl,
+                       motion_end_bits - motion_start_bits,
+                       coeff_end_bits - coeff_start_bits,
+                       total_end_bits - total_start_bits);
+    }
 
     return 0;
 }
