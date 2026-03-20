@@ -77,6 +77,133 @@ static av_always_inline void setctx_2d(uint8_t *ptr, int w, int h,
     }
 }
 
+static av_always_inline int vp9_get_block_qi(const VP9Context *s, int seg_id)
+{
+    int qyac;
+
+    if (s->s.h.segmentation.enabled &&
+        s->s.h.segmentation.feat[seg_id].q_enabled) {
+        if (s->s.h.segmentation.absolute_vals)
+            qyac = av_clip_uintp2(s->s.h.segmentation.feat[seg_id].q_val, 8);
+        else
+            qyac = av_clip_uintp2(s->s.h.yac_qi +
+                                  s->s.h.segmentation.feat[seg_id].q_val, 8);
+    } else {
+        qyac = s->s.h.yac_qi;
+    }
+
+    return av_clip_uintp2(qyac, 8);
+}
+
+static av_always_inline void vp9_export_block_qi(VP9Context *s,
+                                                 int row, int col,
+                                                 int w8, int h8,
+                                                 int qi)
+{
+    if (!s->qp_y_tab)
+        return;
+
+    for (int y = 0; y < h8; y++) {
+        const int yy = row + y;
+        if (yy >= s->qp_tab_h)
+            break;
+        for (int x = 0; x < w8; x++) {
+            const int xx = col + x;
+            if (xx >= s->qp_tab_w)
+                break;
+            s->qp_y_tab[yy * s->qp_tab_w + xx] = (int16_t)qi;
+        }
+    }
+}
+
+static av_always_inline void vp9_fill_mv_cell(MVCellOut *out, const VP9Block *b, int part)
+{
+    out->mv_l0_x = out->mv_l0_y = -32768;
+    out->mv_l1_x = out->mv_l1_y = -32768;
+    out->ref_idx_l0 = -1;
+    out->ref_idx_l1 = -1;
+    out->pred_flag  = 0;
+    out->reserved   = 0;
+
+    if (b->intra)
+        return;
+
+    out->mv_l0_x = b->mv[part][0].x;
+    out->mv_l0_y = b->mv[part][0].y;
+    out->ref_idx_l0 = b->ref[0];
+    out->pred_flag |= 1;
+
+    if (b->comp) {
+        out->mv_l1_x = b->mv[part][1].x;
+        out->mv_l1_y = b->mv[part][1].y;
+        out->ref_idx_l1 = b->ref[1];
+        out->pred_flag |= 2;
+    }
+}
+
+static av_always_inline void vp9_export_block_mv(VP9Context *s, const VP9Block *b,
+                                                 int row, int col, int w4, int h4)
+{
+    int y, x;
+
+    if (!s->mv_tab)
+        return;
+
+    for (y = 0; y < h4; y++) {
+        const int yy = row + y;
+        if (yy >= s->mv_tab_h)
+            break;
+
+        for (x = 0; x < w4; x++) {
+            const int xx = col + x;
+            int part;
+            MVCellOut out;
+
+            if (xx >= s->mv_tab_w)
+                break;
+
+            /*
+             * Map each exported cell to one of b->mv[0..3]:
+             *   0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right
+             * This matches how VP9Block stores per-subblock motion state.
+             */
+            part = (y >= (h4 + 1) / 2 ? 2 : 0) + (x >= (w4 + 1) / 2 ? 1 : 0);
+
+            vp9_fill_mv_cell(&out, b, part);
+            s->mv_tab[yy * s->mv_tab_w + xx] = out;
+        }
+    }
+}
+
+
+static av_always_inline void vp9_export_block_bits(VP9Context *s,
+                                                   int row, int col,
+                                                   int w4, int h4,
+                                                   uint32_t motion_bits,
+                                                   uint32_t coeff_bits)
+{
+    if (!s->block_total_bits || !s->block_motion_bits || !s->block_coeff_bits)
+        return;
+
+    for (int y = 0; y < h4; y++) {
+        const int yy = row + y;
+        if (yy >= s->block_bits_tab_h)
+            break;
+        for (int x = 0; x < w4; x++) {
+            const int xx = col + x;
+            const int idx = yy * s->block_bits_tab_w + xx;
+            if (xx >= s->block_bits_tab_w)
+                break;
+
+            s->block_motion_bits[idx] += motion_bits;
+            s->block_coeff_bits[idx]  += coeff_bits;
+            s->block_total_bits[idx]  += motion_bits + coeff_bits;
+        }
+    }
+}
+
+
+
 static void decode_mode(VP9TileData *td)
 {
     static const uint8_t left_ctx[N_BS_SIZES] = {
@@ -1288,6 +1415,21 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
         b->bl = bl;
         b->bp = bp;
         decode_mode(td);
+
+        /* export per-block luma AC Q index on the 8x8 block grid */
+        if (((VP9Context *)s)->qp_y_tab) {
+            const int qi = vp9_get_block_qi(s, b->seg_id);
+            vp9_export_block_qi((VP9Context *)s, row, col, w4, h4, qi);
+        }
+
+        /* export per-block motion vectors on the same grid */
+        if (((VP9Context *)s)->mv_tab) {
+            vp9_export_block_mv((VP9Context *)s, b, row, col, w4, h4);
+        }
+
+        uint32_t motion_bits = td->c->bit_count;
+        uint32_t coeff_bits  = 0;
+
         b->uvtx = b->tx - ((s->ss_h && w4 * 2 == (1 << b->tx)) ||
                            (s->ss_v && h4 * 2 == (1 << b->tx)));
 
@@ -1311,6 +1453,7 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
                 has_coeffs = decode_coeffs_16bpp(td);
             }
             // videoparser: accumulate coefficient bits
+            coeff_bits = td->c->bit_count;
             sf->coefs_bit_count += td->c->bit_count;
 
             if (!has_coeffs && b->bs <= BS_8x8 && !b->intra) {
@@ -1319,6 +1462,7 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
                 memset(&td->left_skip_ctx[td->row7], 1, h4);
             }
         } else {
+            coeff_bits = 0;
             int row7 = td->row7;
 
 #define SPLAT_ZERO_CTX(v, n) \
@@ -1353,6 +1497,10 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
             case 4: SPLAT_ZERO_YUV(td->left, nnz_ctx, row7, 4, v); break;
             case 8: SPLAT_ZERO_YUV(td->left, nnz_ctx, row7, 8, v); break;
             }
+        }
+
+        if (((VP9Context *)s)->block_total_bits) {
+            vp9_export_block_bits((VP9Context *)s, row, col, w4, h4, motion_bits, coeff_bits);
         }
 
         if (s->pass == 1) {

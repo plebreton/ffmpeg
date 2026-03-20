@@ -83,6 +83,23 @@ typedef struct VP9Filter {
                               [8 /* rows */][4 /* 0=16, 1=8, 2=4, 3=inner4 */];
 } VP9Filter;
 
+typedef struct MVCellOut {
+    int16_t mv_l0_x;
+    int16_t mv_l0_y;
+    int16_t mv_l1_x;
+    int16_t mv_l1_y;
+    int8_t  ref_idx_l0;
+    int8_t  ref_idx_l1;
+    int8_t  pred_flag;
+    int8_t  reserved;
+} MVCellOut;
+
+typedef struct VP9BitsCell {
+    uint32_t total_bits;
+    uint32_t motion_bits;
+    uint32_t coeff_bits;
+} VP9BitsCell;
+
 typedef struct VP9Block {
     uint8_t seg_id, intra, comp, ref[2], mode[4], uvmode, skip;
     enum FilterMode filter;
@@ -96,6 +113,7 @@ typedef struct VP9Block {
 typedef struct VP9TileData VP9TileData;
 
 typedef struct VP9Context {
+    const AVClass *class;
     VP9SharedContext s;
     VP9TileData *td;
 
@@ -177,7 +195,34 @@ typedef struct VP9Context {
     SharedFrameInfo vp_hidden_frame_stats;
     int vp_hidden_frame_distance;
     int vp_hidden_stats_valid;  ///< Whether vp_hidden_frame_stats has valid data
+    // add export of QP, MV, and bits maps
+    char *qp_export_path;
+    FILE *qp_export_file;
+    int16_t *qp_y_tab;
+    int qp_tab_w;
+    int qp_tab_h;
+    int64_t qp_export_frame_counter;
+
+    char *mv_export_path;
+    FILE *mv_export_file;
+    MVCellOut *mv_tab;
+    int mv_tab_w;
+    int mv_tab_h;
+    int64_t mv_export_frame_counter;
+
+    char *block_bits_export_path;
+    FILE *block_bits_export_file;
+    uint32_t *block_total_bits;
+    uint32_t *block_motion_bits;
+    uint32_t *block_coeff_bits;
+    int block_bits_tab_w;
+    int block_bits_tab_h;
+    int64_t block_bits_export_frame_counter;
+
 } VP9Context;
+
+
+
 
 struct VP9TileData {
     const VP9Context *s;
