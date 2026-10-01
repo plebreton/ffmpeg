@@ -199,25 +199,28 @@ int ff_h264_alloc_tables(H264Context *h)
     const int mb_array_size = h->mb_height * h->mb_stride;
     int x, y;
 
-
-
     if (!FF_ALLOCZ_TYPED_ARRAY(h->intra4x4_pred_mode,     row_mb_num * 8)  ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->non_zero_count,         big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->slice_table_base,       st_size)         ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->cbp_table,              big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->chroma_pred_mode_table, big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[0],           row_mb_num * 8)  ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[1],           row_mb_num * 8)  ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->direct_table,           big_mb_num * 4)  ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->list_counts,            big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mb2b_xy,                big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mb2br_xy,               big_mb_num)      ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mb_total_bits,          mb_array_size)   ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mb_motion_bits,         mb_array_size)   ||
-    !FF_ALLOCZ_TYPED_ARRAY(h->mb_coeff_bits,          mb_array_size))
-    return AVERROR(ENOMEM);
+        !FF_ALLOCZ_TYPED_ARRAY(h->non_zero_count,         big_mb_num)      ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->slice_table_base,       st_size)         ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->cbp_table,              big_mb_num)      ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->chroma_pred_mode_table, big_mb_num)      ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[0],           row_mb_num * 8)  ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->mvd_table[1],           row_mb_num * 8)  ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->direct_table,           big_mb_num * 4)  ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->list_counts,            big_mb_num)      ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->mb2b_xy,                big_mb_num)      ||
+        !FF_ALLOCZ_TYPED_ARRAY(h->mb2br_xy,               big_mb_num))
+        return AVERROR(ENOMEM);
 
-    h->mb_bits_array_size = mb_array_size;
+    // videoparser: per-MB bits for each DPB entry, only for the bits export
+    if (h->mb_bits_export_path) {
+        const size_t bits_size = (size_t)mb_array_size * H264_MAX_PICTURE_COUNT;
+        if (!FF_ALLOCZ_TYPED_ARRAY(h->mb_total_bits,  bits_size) ||
+            !FF_ALLOCZ_TYPED_ARRAY(h->mb_motion_bits, bits_size) ||
+            !FF_ALLOCZ_TYPED_ARRAY(h->mb_coeff_bits,  bits_size))
+            return AVERROR(ENOMEM);
+        h->mb_bits_array_size = mb_array_size;
+    }
     h->slice_ctx[0].intra4x4_pred_mode = h->intra4x4_pred_mode;
     h->slice_ctx[0].mvd_table[0] = h->mvd_table[0];
     h->slice_ctx[0].mvd_table[1] = h->mvd_table[1];
@@ -528,7 +531,8 @@ static int export_mb_bits_matrix(H264Context *h, const H264Picture *p)
 {
     int32_t header[4];
 
-    if (!h->mb_bits_export_file || !p)
+    if (!h->mb_bits_export_file || !p || !h->mb_total_bits ||
+        p < h->DPB || p >= h->DPB + H264_MAX_PICTURE_COUNT)
         return 0;
 
     header[0] = h->mb_bits_export_frame_counter++;
@@ -539,17 +543,22 @@ static int export_mb_bits_matrix(H264Context *h, const H264Picture *p)
     if (fwrite(header, sizeof(header[0]), 4, h->mb_bits_export_file) != 4)
         return AVERROR(EIO);
 
-    for (int y = 0; y < p->mb_height; y++) {
-        for (int x = 0; x < p->mb_width; x++) {
-            const int idx = y * p->mb_stride + x;
-            MBBitsCell out;
+    {
+        const int slot = p - h->DPB;
+        const size_t base = (size_t)slot * h->mb_bits_array_size;
 
-            out.total_bits  = h->mb_total_bits[idx];
-            out.motion_bits = h->mb_motion_bits[idx];
-            out.coeff_bits  = h->mb_coeff_bits[idx];
+        for (int y = 0; y < p->mb_height; y++) {
+            for (int x = 0; x < p->mb_width; x++) {
+                const size_t idx = base + y * p->mb_stride + x;
+                MBBitsCell out;
 
-            if (fwrite(&out, sizeof(out), 1, h->mb_bits_export_file) != 1)
-                return AVERROR(EIO);
+                out.total_bits  = h->mb_total_bits[idx];
+                out.motion_bits = h->mb_motion_bits[idx];
+                out.coeff_bits  = h->mb_coeff_bits[idx];
+
+                if (fwrite(&out, sizeof(out), 1, h->mb_bits_export_file) != 1)
+                    return AVERROR(EIO);
+            }
         }
     }
 
@@ -1156,13 +1165,6 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
     ret = export_mb_bits_matrix(h, srcp);
     if (ret < 0)
         return ret;
-
-    if (h->mb_total_bits) {
-        memset(h->mb_total_bits,  0, h->mb_bits_array_size * sizeof(*h->mb_total_bits));
-        memset(h->mb_motion_bits, 0, h->mb_bits_array_size * sizeof(*h->mb_motion_bits));
-        memset(h->mb_coeff_bits,  0, h->mb_bits_array_size * sizeof(*h->mb_coeff_bits));
-    }
-
 
     return 0;
 fail:

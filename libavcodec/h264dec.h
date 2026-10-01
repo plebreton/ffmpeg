@@ -340,6 +340,10 @@ typedef struct H264SliceContext {
     int delta_poc[2];
     int curr_pic_num;
     int max_pic_num;
+
+    // videoparser: bits of the motion vector differences of the current MB,
+    // for the bits export
+    uint32_t vp_mb_motion_bits;
 } H264SliceContext;
 
 /**
@@ -604,6 +608,8 @@ typedef struct H264Context {
     char *mb_bits_export_path;
     FILE *mb_bits_export_file;
 
+    // per-MB bits, H264_MAX_PICTURE_COUNT arrays of mb_bits_array_size, one
+    // for each DPB entry
     uint32_t *mb_total_bits;
     uint32_t *mb_motion_bits;
     uint32_t *mb_coeff_bits;
@@ -758,22 +764,29 @@ void ff_h264_free_tables(H264Context *h);
 void ff_h264_set_erpic(ERPicture *dst, const H264Picture *src);
 
 
+/**
+ * videoparser: store the bits of the current macroblock for the bits export.
+ *
+ * The bits are stored per DPB entry, since frames are exported in output
+ * order. Both fields of a field pair are stored in the same entry.
+ */
 static av_always_inline void export_mb_bits(H264Context *h, H264SliceContext *sl,
                                             uint32_t motion_bits,
                                             uint32_t coeff_bits,
                                             uint32_t total_bits)
 {
     const int idx = sl->mb_xy;
+    size_t offset;
 
-    if (!h->mb_total_bits || !h->mb_motion_bits || !h->mb_coeff_bits)
+    if (!h->mb_total_bits || !h->cur_pic_ptr)
         return;
     if (idx < 0 || idx >= h->mb_bits_array_size)
         return;
 
-    h->mb_motion_bits[idx] += motion_bits;
-    h->mb_coeff_bits[idx]  += coeff_bits;
-    h->mb_total_bits[idx]  += total_bits;
+    offset = (size_t)(h->cur_pic_ptr - h->DPB) * h->mb_bits_array_size + idx;
+    h->mb_motion_bits[offset] += motion_bits;
+    h->mb_coeff_bits[offset]  += coeff_bits;
+    h->mb_total_bits[offset]  += total_bits;
 }
-
 
 #endif /* AVCODEC_H264DEC_H */

@@ -533,6 +533,15 @@ static int h264_frame_start(H264Context *h)
     if ((ret = alloc_picture(h, pic)) < 0)
         return ret;
 
+    // videoparser: clear the per-MB bits of this DPB entry for the bits export
+    if (h->mb_total_bits) {
+        const size_t base = (size_t)i * h->mb_bits_array_size;
+        const size_t size = h->mb_bits_array_size * sizeof(*h->mb_total_bits);
+        memset(h->mb_total_bits  + base, 0, size);
+        memset(h->mb_motion_bits + base, 0, size);
+        memset(h->mb_coeff_bits  + base, 0, size);
+    }
+
     h->cur_pic_ptr = pic;
     ff_h264_unref_picture(&h->cur_pic);
     if (CONFIG_ERROR_RESILIENCE) {
@@ -2742,6 +2751,7 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
 
         for (;;) {
             int ret, eos;
+            unsigned vp_eos_start; // videoparser
             if (sl->mb_x + sl->mb_y * h->mb_width >= sl->next_slice_idx) {
                 av_log(h->avctx, AV_LOG_ERROR, "Slice overlaps with next at %d\n",
                        sl->next_slice_idx);
@@ -2765,7 +2775,10 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
                     ff_h264_hl_decode_mb(h, sl);
                 sl->mb_y--;
             }
+            vp_eos_start = sl->cabac.total_bit_count; // videoparser
             eos = get_cabac_terminate(&sl->cabac);
+            // videoparser: count end_of_slice_flag in the last MB
+            export_mb_bits(h, sl, 0, 0, sl->cabac.total_bit_count - vp_eos_start);
 
             if ((h->workaround_bugs & FF_BUG_TRUNCATED) &&
                 sl->cabac.bytestream > sl->cabac.bytestream_end + 2) {

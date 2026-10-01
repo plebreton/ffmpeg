@@ -698,11 +698,15 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
     const int pixel_shift = h->pixel_shift;
 
     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y*h->mb_stride;
-    int total_start_bits  = get_bits_count(&sl->gb);
-    int motion_start_bits = total_start_bits;
-    int motion_end_bits   = total_start_bits;
-    int coeff_start_bits  = -1;
-    int coeff_end_bits    = -1;
+
+    // videoparser: bits of this MB for the bits export. With data
+    // partitioning, the residual is read from another partition, so its bits
+    // are not in the difference of the sl->gb position.
+    const int vp_start_bits = get_bits_count(&sl->gb);
+    int vp_coeff_bits = 0;
+    int vp_partition_bits = 0;
+    int vp_mvd_start, vp_coeff_start;
+    sl->vp_mb_motion_bits = 0;
 
     memset(sl->mvd_cache, 0, sizeof(sl->mvd_cache)); // videoparser: Clear motion vector cache for the current macroblock
 
@@ -726,10 +730,9 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
             }
             decode_mb_skip(h, sl);
 
-            export_mb_bits((H264Context *)h, sl,
-                   get_bits_count(&sl->gb) - motion_start_bits,
-                   0,
-                   get_bits_count(&sl->gb) - total_start_bits);
+            // videoparser: a skipped MB has no MVD or residual
+            export_mb_bits((H264Context *)h, sl, 0, 0,
+                           get_bits_count(&sl->gb) - vp_start_bits);
 
             return 0;
         }
@@ -800,6 +803,11 @@ decode_intra_mb:
         memset(h->non_zero_count[mb_xy], 16, 48);
 
         h->cur_pic.mb_type[mb_xy] = mb_type;
+
+        // videoparser: the raw samples count as residual
+        export_mb_bits((H264Context *)h, sl, 0, mb_size,
+                       get_bits_count(&sl->gb) - vp_start_bits +
+                       (gb != &sl->gb ? mb_size : 0));
         return 0;
     }
 
@@ -932,8 +940,10 @@ decode_intra_mb:
                         uint8_t (*mvd_cache)[2] = &sl->mvd_cache[list][scan8[index]]; // videoparser: Cache for differential motion vectors
                         pred_motion(h, sl, index, block_width, list, sl->ref_cache[list][ scan8[index] ], &mx, &my);
                         // videoparser: Decode differential motion vector components from bitstream
+                        vp_mvd_start = get_bits_count(&sl->gb); // videoparser
                         mdx = (unsigned)get_se_golomb(&sl->gb);
                         mdy = (unsigned)get_se_golomb(&sl->gb);
+                        sl->vp_mb_motion_bits += get_bits_count(&sl->gb) - vp_mvd_start; // videoparser
                         mx += mdx;
                         my += mdy;
                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
@@ -1001,8 +1011,10 @@ decode_intra_mb:
             for (list = 0; list < sl->list_count; list++) {
                 if(IS_DIR(mb_type, 0, list)){
                     pred_motion(h, sl, 0, 4, list, sl->ref_cache[list][ scan8[0] ], &mx, &my);
+                    vp_mvd_start = get_bits_count(&sl->gb); // videoparser
                     mx += (unsigned)get_se_golomb(&sl->gb);
                     my += (unsigned)get_se_golomb(&sl->gb);
+                    sl->vp_mb_motion_bits += get_bits_count(&sl->gb) - vp_mvd_start; // videoparser
                     ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
 
                     fill_rectangle(sl->mv_cache[list][ scan8[0] ], 4, 4, 8, pack16to32(mx,my), 4);
@@ -1037,8 +1049,10 @@ decode_intra_mb:
                     if(IS_DIR(mb_type, i, list)){
                         pred_16x8_motion(h, sl, 8*i, list, sl->ref_cache[list][scan8[0] + 16*i], &mx, &my);
                         // videoparser
+                        vp_mvd_start = get_bits_count(&sl->gb); // videoparser
                         mdx = (unsigned)get_se_golomb(&sl->gb);
                         mdy = (unsigned)get_se_golomb(&sl->gb);
+                        sl->vp_mb_motion_bits += get_bits_count(&sl->gb) - vp_mvd_start; // videoparser
                         mx += mdx;
                         my += mdy;
                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
@@ -1081,8 +1095,10 @@ decode_intra_mb:
                     if(IS_DIR(mb_type, i, list)){
                         pred_8x16_motion(h, sl, i*4, list, sl->ref_cache[list][ scan8[0] + 2*i ], &mx, &my);
                         // videoparser
+                        vp_mvd_start = get_bits_count(&sl->gb); // videoparser
                         mdx = (unsigned)get_se_golomb(&sl->gb);
                         mdy = (unsigned)get_se_golomb(&sl->gb);
+                        sl->vp_mb_motion_bits += get_bits_count(&sl->gb) - vp_mvd_start; // videoparser
                         mx += mdx;
                         my += mdy;
                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
@@ -1171,8 +1187,7 @@ decode_intra_mb:
             scan    = sl->qscale ? h->zigzag_scan : h->zigzag_scan_q0;
         }
 
-        motion_end_bits = get_bits_count(&sl->gb);
-        coeff_start_bits = motion_end_bits;
+        vp_coeff_start = get_bits_count(gb); // videoparser
 
         if ((ret = decode_luma_residual(h, sl, gb, scan, scan8x8, pixel_shift, mb_type, cbp, 0)) < 0 ) {
             return -1;
@@ -1216,6 +1231,10 @@ decode_intra_mb:
                 fill_rectangle(&sl->non_zero_count_cache[scan8[32]], 4, 4, 8, 0, 1);
             }
         }
+        // videoparser
+        vp_coeff_bits = get_bits_count(gb) - vp_coeff_start;
+        if (gb != &sl->gb)
+            vp_partition_bits = vp_coeff_bits;
     }else{
         fill_rectangle(&sl->non_zero_count_cache[scan8[ 0]], 4, 4, 8, 0, 1);
         fill_rectangle(&sl->non_zero_count_cache[scan8[16]], 4, 4, 8, 0, 1);
@@ -1224,18 +1243,8 @@ decode_intra_mb:
     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
     write_back_non_zero_count(h, sl);
 
-    {
-        int total_end_bits = get_bits_count(&sl->gb);
-
-        if (coeff_start_bits < 0)
-            coeff_start_bits = total_end_bits;
-        coeff_end_bits = total_end_bits;
-
-        export_mb_bits((H264Context *)h, sl,
-                       motion_end_bits - motion_start_bits,
-                       coeff_end_bits - coeff_start_bits,
-                       total_end_bits - total_start_bits);
-    }
+    export_mb_bits((H264Context *)h, sl, sl->vp_mb_motion_bits, vp_coeff_bits,
+                   get_bits_count(&sl->gb) - vp_start_bits + vp_partition_bits);
 
     return 0;
 }

@@ -43,6 +43,9 @@ typedef struct CABACContext{
     int range;
     int bit_count; // videoparser: bit_count keeps track of the total bits
                    // written to the compressed bitstream
+    unsigned total_bit_count; // videoparser: like bit_count, but never reset
+                              // and also counting terminate bins, for the
+                              // per-block bit exports
     const uint8_t *bytestream_start;
     const uint8_t *bytestream;
     const uint8_t *bytestream_end;

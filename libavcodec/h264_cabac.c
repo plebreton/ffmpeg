@@ -1558,6 +1558,7 @@ static int decode_cabac_mb_mvd(H264SliceContext *sl, int ctxbase, int amvd, int 
     my += myd;\
     sf = videoparser_get_shared_frame_info(h->cur_pic_ptr->f);\
     sf->motion_bit_count += sl->cabac.bit_count;\
+    sl->vp_mb_motion_bits += sl->cabac.bit_count;\
     sf->mv_coded_count++;\
     mpx = (mpx > 127) ? 127 : ((mpx < -128) ? -128 : mpx); \
     mpy = (mpy > 127) ? 127 : ((mpy < -128) ? -128 : mpy); \
@@ -1660,6 +1661,7 @@ decode_cabac_residual_internal(const H264Context *h, H264SliceContext *sl,
     cc.low       = sl->cabac.low;
     cc.bytestream= sl->cabac.bytestream;
     cc.bit_count = sl->cabac.bit_count; // videoparser
+    cc.total_bit_count = sl->cabac.total_bit_count; // videoparser
 #if !UNCHECKED_BITSTREAM_READER || ARCH_AARCH64
     cc.bytestream_end = sl->cabac.bytestream_end;
 #endif
@@ -1781,6 +1783,7 @@ decode_cabac_residual_internal(const H264Context *h, H264SliceContext *sl,
             sl->cabac.low       = cc.low       ;
             sl->cabac.bytestream= cc.bytestream;
             sl->cabac.bit_count = cc.bit_count; // videoparser
+            sl->cabac.total_bit_count = cc.total_bit_count; // videoparser
 #endif
 
 }
@@ -1941,17 +1944,15 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
 
     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y * h->mb_stride;
 
-    uint32_t motion_bits = 0;
-    uint32_t coeff_bits  = 0;
-    uint32_t total_bits  = 0;
-
+    // videoparser: bits of this MB for the bits export. total_bit_count is
+    // never reset, unlike bit_count, which the statistics use.
+    const unsigned vp_start_bits = sl->cabac.total_bit_count;
+    uint32_t vp_coeff_bits = 0;
+    sl->vp_mb_motion_bits = 0;
 
     ff_tlog(h->avctx, "pic:%d mb:%d/%d\n", h->poc.frame_num, sl->mb_x, sl->mb_y);
     if (sl->slice_type_nos != AV_PICTURE_TYPE_I) {
         int skip;
-
-        sl->cabac.bit_count = 0;
-
         /* a skipped mb needs the aff flag from the following mb */
         if (FRAME_MBAFF(h) && (sl->mb_y & 1) == 1 && sl->prev_mb_skipped)
             skip = sl->next_mb_skipped;
@@ -1972,10 +1973,9 @@ int ff_h264_decode_mb_cabac(const H264Context *h, H264SliceContext *sl)
             h->chroma_pred_mode_table[mb_xy] = 0;
             sl->last_qscale_diff = 0;
 
-            motion_bits = sl->cabac.bit_count;
-            total_bits  = motion_bits;
-            export_mb_bits((H264Context *)h, sl, motion_bits, 0, total_bits);
-
+            // videoparser: a skipped MB has no MVD or residual
+            export_mb_bits((H264Context *)h, sl, 0, 0,
+                           sl->cabac.total_bit_count - vp_start_bits);
 
             return 0;
 
@@ -2092,6 +2092,10 @@ decode_intra_mb:
         memset(h->non_zero_count[mb_xy], 16, 48);
         h->cur_pic.mb_type[mb_xy] = mb_type;
         sl->last_qscale_diff = 0;
+
+        // videoparser: the raw samples count as residual
+        export_mb_bits((H264Context *)h, sl, 0, mb_size * 8,
+                       sl->cabac.total_bit_count - vp_start_bits + mb_size * 8);
         return 0;
     }
 
@@ -2459,7 +2463,6 @@ decode_intra_mb:
             scan    = sl->qscale ? h->zigzag_scan : h->zigzag_scan_q0;
         }
 
-        motion_bits = sl->cabac.bit_count;
         sl->cabac.bit_count = 0; // videoparser
         decode_cabac_luma_residual(h, sl, scan, scan8x8, pixel_shift, mb_type, cbp, 0);
         if (CHROMA444(h)) {
@@ -2513,6 +2516,8 @@ decode_intra_mb:
                 fill_rectangle(&sl->non_zero_count_cache[scan8[32]], 4, 4, 8, 0, 1);
             }
         }
+        // videoparser: bit_count was reset before the residual
+        vp_coeff_bits = sl->cabac.bit_count;
     } else {
         fill_rectangle(&sl->non_zero_count_cache[scan8[ 0]], 4, 4, 8, 0, 1);
         fill_rectangle(&sl->non_zero_count_cache[scan8[16]], 4, 4, 8, 0, 1);
@@ -2520,16 +2525,14 @@ decode_intra_mb:
         sl->last_qscale_diff = 0;
     }
 
-    coeff_bits = sl->cabac.bit_count;
-    total_bits = motion_bits + coeff_bits;
-    export_mb_bits((H264Context *)h, sl, motion_bits, coeff_bits, total_bits);
-    
     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
     // videoparser
     sf = videoparser_get_shared_frame_info(h->cur_pic_ptr->f);
     if (sf && sl->cabac.bit_count != 0) {
       sf->coefs_bit_count += sl->cabac.bit_count;
     }
+    export_mb_bits((H264Context *)h, sl, sl->vp_mb_motion_bits, vp_coeff_bits,
+                   sl->cabac.total_bit_count - vp_start_bits);
     write_back_non_zero_count(h, sl);
 
     memcpy(sl->mb0, sl->mb, sizeof(sl->mb)); // videoparser

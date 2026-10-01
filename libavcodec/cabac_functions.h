@@ -80,6 +80,7 @@ static inline void renorm_cabac_decoder_once(CABACContext *c){
     int shift= (uint32_t)(c->range - 0x100)>>31;
     c->range<<= shift;
     c->low  <<= shift;
+    c->total_bit_count += shift; // videoparser
     if(!(c->low & CABAC_MASK))
         refill(c);
 }
@@ -132,6 +133,7 @@ static av_always_inline int get_cabac_inline(CABACContext *c, uint8_t * const st
     c->range<<= lps_mask;
     c->low  <<= lps_mask;
     c->bit_count += lps_mask; // videoparser
+    c->total_bit_count += lps_mask; // videoparser
     if(!(c->low & CABAC_MASK))
         refill2(c);
     return bit;
@@ -151,6 +153,7 @@ av_unused static int get_cabac_bypass(CABACContext *c){
     int range;
     c->low += c->low;
     c->bit_count++; // videoparser
+    c->total_bit_count++; // videoparser
 
     if(!(c->low & CABAC_MASK))
         refill(c);
@@ -170,6 +173,7 @@ static av_always_inline int get_cabac_bypass_sign(CABACContext *c, int val){
     int range, mask;
     c->low += c->low;
     c->bit_count++; // videoparser
+    c->total_bit_count++; // videoparser
 
     if(!(c->low & CABAC_MASK))
         refill(c);
