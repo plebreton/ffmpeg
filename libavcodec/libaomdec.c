@@ -30,6 +30,7 @@
 #include "libavutil/cpu.h"
 #include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
@@ -38,19 +39,39 @@
 #include "itut35.h"
 #include "libaom.h"
 #include "profiles.h"
+#include "videoparser_export.h"
 
 // videoparser: Include inspection API for MV extraction
 #ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
 #include "av1/decoder/inspection.h"
 #include "av1/common/enums.h"
+#include "av1/common/common_data.h"
 #include <math.h>
 #endif
+
+// videoparser: export data of the last decoded frames, until they are output
+#define VP_EXPORT_CACHE_SIZE 16
+
+typedef struct VPExportCacheEntry {
+    const void *key;      ///< libaom frame buffer of the frame
+    AVBufferRef *buf;     ///< VPExportHeader and data
+} VPExportCacheEntry;
 
 // videoparser: Helper macro
 #define VP_SQR(_x_) ((_x_) * (_x_))
 
 typedef struct AV1DecodeContext {
+    const AVClass *class;
     struct aom_codec_ctx decoder;
+    // videoparser: per-block QP, MV and bits exports
+    char *qp_export_path;
+    char *mv_export_path;
+    char *bits_export_path;
+    VPExportFiles vp_export_files;
+    VPExportCacheEntry vp_export_cache[VP_EXPORT_CACHE_SIZE];
+    int vp_export_cache_next;
+    int32_t vp_export_counter;  ///< number of output frames written
+    int vp_export_error;        ///< error from the inspection callback
 #ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
     // videoparser: Inspection data for MV extraction
     insp_frame_data insp_data;
@@ -60,6 +81,136 @@ typedef struct AV1DecodeContext {
 } AV1DecodeContext;
 
 #ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
+/**
+ * videoparser: spread the bits of a block (in 1/8 bits) over its 4x4 units in
+ * the frame. Each value is converted to whole bits from its running sum over
+ * the frame, so that the sum over the frame is the frame's count in whole bits
+ * (as motion_bit_count and coefs_bit_count). The other bits are spread
+ * separately, so that motion + coeff <= total holds in every unit.
+ */
+static void videoparser_av1_spread_bits(VPExportBits *bits, int stride,
+                                        int row, int col, int w, int h,
+                                        const uint32_t value[3], uint64_t sum[3])
+{
+    const int n = w * h;
+    int k = 0;
+
+    for (int y = row; y < row + h; y++) {
+        for (int x = col; x < col + w; x++, k++) {
+            VPExportBits *b = &bits[y * stride + x];
+            uint32_t out[3];
+
+            for (int i = 0; i < 3; i++) {
+                const uint32_t share = value[i] / n + (k < value[i] % n);
+                out[i] = (uint32_t)(((sum[i] + share) >> 3) - (sum[i] >> 3));
+                sum[i] += share;
+            }
+            b->motion_bits += out[0];
+            b->coeff_bits  += out[1];
+            b->total_bits  += out[0] + out[1] + out[2];
+        }
+    }
+}
+
+/**
+ * videoparser: store the QP, MV and bits of the decoded frame for the
+ * exports, until the frame is output
+ */
+static void videoparser_av1_store_export(AV1DecodeContext *ctx)
+{
+    const insp_frame_data *fd = &ctx->insp_data;
+    const int rows = fd->mi_rows, cols = fd->mi_cols;
+    VPExportCacheEntry *entry = NULL;
+    VPExportHeader *h;
+    AVBufferRef *buf;
+    uint64_t sum[3] = { 0 };
+    int ret;
+
+    buf = vp_export_alloc_buffer(&ctx->vp_export_files, 0, cols, rows, cols, rows,
+                                 cols, rows, 4, &ret);
+    if (!buf) {
+        if (ret < 0)
+            ctx->vp_export_error = ret;
+        return;
+    }
+    h = (VPExportHeader *)buf->data;
+
+    for (int y = 0; y < rows; y++) {
+        for (int x = 0; x < cols; x++) {
+            const insp_mi_data *mi = &fd->mi_grid[y * cols + x];
+
+            if (h->qp_w)
+                vp_export_qp(h)[y * cols + x] = mi->vp_qindex;
+
+            if (h->mv_w && mi->ref_frame[0] > INTRA_FRAME) {
+                VPExportMV *mv = &vp_export_mv(h)[y * cols + x];
+                mv->mv_l0_x    = mi->mv[0].col;
+                mv->mv_l0_y    = mi->mv[0].row;
+                mv->ref_idx_l0 = mi->ref_frame[0];
+                mv->pred_flag  = 1;
+                if (mi->ref_frame[1] > INTRA_FRAME) {
+                    mv->mv_l1_x    = mi->mv[1].col;
+                    mv->mv_l1_y    = mi->mv[1].row;
+                    mv->ref_idx_l1 = mi->ref_frame[1];
+                    mv->pred_flag |= 2;
+                }
+            }
+
+            // the bits are stored in each 4x4 unit of a block; spread them
+            // from the top-left unit of the block
+            if (h->bits_w && mi->vp_mi_row == y && mi->vp_mi_col == x &&
+                mi->bsize >= 0 && mi->bsize < BLOCK_SIZES_ALL) {
+                const uint32_t total = mi->vp_total_bits;
+                const uint32_t motion = FFMIN(mi->vp_motion_bits, total);
+                const uint32_t coeff = FFMIN(mi->vp_coeff_bits, total - motion);
+                const uint32_t value[3] = { motion, coeff, total - motion - coeff };
+                const int w = FFMIN(mi_size_wide[mi->bsize], cols - x);
+                const int bh = FFMIN(mi_size_high[mi->bsize], rows - y);
+
+                videoparser_av1_spread_bits(vp_export_bits(h), cols, y, x, w, bh,
+                                            value, sum);
+            }
+        }
+    }
+
+    // replace the data of a frame buffer that is decoded again, or the oldest
+    for (int i = 0; i < VP_EXPORT_CACHE_SIZE; i++) {
+        if (ctx->vp_export_cache[i].buf && ctx->vp_export_cache[i].key == fd->vp_frame_key) {
+            entry = &ctx->vp_export_cache[i];
+            break;
+        }
+    }
+    if (!entry) {
+        entry = &ctx->vp_export_cache[ctx->vp_export_cache_next];
+        ctx->vp_export_cache_next = (ctx->vp_export_cache_next + 1) % VP_EXPORT_CACHE_SIZE;
+    }
+    av_buffer_unref(&entry->buf);
+    entry->key = fd->vp_frame_key;
+    entry->buf = buf;
+}
+
+/**
+ * videoparser: write the exports of an output frame, numbered in output order
+ */
+static int videoparser_av1_write_export(AV1DecodeContext *ctx, const struct aom_image *img)
+{
+    VPExportHeader *h = NULL;
+
+    if (ctx->vp_export_error < 0)
+        return ctx->vp_export_error;
+
+    for (int i = 0; i < VP_EXPORT_CACHE_SIZE; i++) {
+        if (ctx->vp_export_cache[i].buf && ctx->vp_export_cache[i].key == img->vp_frame_key) {
+            h = (VPExportHeader *)ctx->vp_export_cache[i].buf->data;
+            break;
+        }
+    }
+    if (h)
+        h->id = ctx->vp_export_counter;
+    ctx->vp_export_counter++;
+    return vp_export_write_header(&ctx->vp_export_files, h);
+}
+
 // videoparser: Inspection callback to capture frame data for MV extraction
 // The callback signature from libaom is: void (*aom_inspect_cb)(void *decoder, void *ctx)
 static void videoparser_av1_inspect_callback(void *pbi, void *user_data) {
@@ -73,6 +224,7 @@ static void videoparser_av1_inspect_callback(void *pbi, void *user_data) {
     // Note: This captures MV, mode, and other per-block information
     if (ifd_inspect(&ctx->insp_data, pbi, 0) == 1) {
         ctx->insp_data_valid = 1;
+        videoparser_av1_store_export(ctx);
     }
 }
 #endif
@@ -87,6 +239,14 @@ static av_cold int aom_init(AVCodecContext *avctx,
 
     av_log(avctx, AV_LOG_VERBOSE, "%s\n", aom_codec_version_str());
     av_log(avctx, AV_LOG_VERBOSE, "%s\n", aom_codec_build_config());
+
+    // videoparser
+    {
+        int ret = vp_export_open(&ctx->vp_export_files, ctx->qp_export_path,
+                                 ctx->mv_export_path, ctx->bits_export_path);
+        if (ret < 0)
+            return ret;
+    }
 
     if (aom_codec_dec_init(&ctx->decoder, iface, &deccfg, 0) != AOM_CODEC_OK) {
         const char *error = aom_codec_error(&ctx->decoder);
@@ -461,6 +621,10 @@ static int aom_decode(AVCodecContext *avctx, AVFrame *picture,
 #ifdef AOM_CTRL_AV1_SET_INSPECTION_CALLBACK
         // videoparser: Extract MV statistics from inspection data
         videoparser_av1_extract_mv_stats(picture, ctx);
+
+        // videoparser: per-block exports of the output frame
+        if ((ret = videoparser_av1_write_export(ctx, img)) < 0)
+            return ret;
 #endif
 
         *got_frame = 1;
@@ -477,7 +641,10 @@ static av_cold int aom_free(AVCodecContext *avctx)
     if (ctx->insp_data.mi_grid) {
         ifd_clear(&ctx->insp_data);
     }
+    for (int i = 0; i < VP_EXPORT_CACHE_SIZE; i++)
+        av_buffer_unref(&ctx->vp_export_cache[i].buf);
 #endif
+    vp_export_close(&ctx->vp_export_files); // videoparser
 
     aom_codec_destroy(&ctx->decoder);
     return 0;
@@ -488,12 +655,30 @@ static av_cold int av1_init(AVCodecContext *avctx)
     return aom_init(avctx, aom_codec_av1_dx());
 }
 
+// videoparser: options for the per-block exports
+#define OFFSET(x) offsetof(AV1DecodeContext, x)
+#define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+static const AVOption options[] = {
+    { "export_qp_matrix", "Write per-frame AV1 QP matrices to a binary file", OFFSET(qp_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_mv_matrix", "Write per-frame AV1 motion-vector matrix to a binary file", OFFSET(mv_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_ctu_bits_matrix", "Write per-frame AV1 block bit counts to a binary file", OFFSET(bits_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { NULL }
+};
+
+static const AVClass libaom_av1_class = {
+    .class_name = "libaom-av1 decoder",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
 const FFCodec ff_libaom_av1_decoder = {
     .p.name         = "libaom-av1",
     CODEC_LONG_NAME("libaom AV1"),
     .p.type         = AVMEDIA_TYPE_VIDEO,
     .p.id           = AV_CODEC_ID_AV1,
     .priv_data_size = sizeof(AV1DecodeContext),
+    .p.priv_class   = &libaom_av1_class,
     .init           = av1_init,
     .close          = aom_free,
     FF_CODEC_DECODE_CB(aom_decode),

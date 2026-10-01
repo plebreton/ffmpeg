@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "libavutil/buffer.h"
 #include "libavutil/error.h"
 #include "libavutil/frame.h"
 
@@ -102,18 +103,17 @@ static inline void vp_export_mv_none(VPExportMV *mv)
 }
 
 /**
- * Attach a zeroed export buffer to the frame, for the exports whose file is
- * open. Returns NULL if no export is on, or on allocation failure (with *ret
- * set to an error).
+ * Allocate a zeroed export buffer for the exports whose file is open.
+ * Returns NULL if no export is on, or on allocation failure (with *ret set
+ * to an error).
  */
-static inline VPExportHeader *vp_export_alloc(AVFrame *f, const VPExportFiles *files,
-                                              int32_t id,
-                                              int qp_w, int qp_h,
-                                              int mv_w, int mv_h,
-                                              int bits_w, int bits_h,
-                                              int bits_block_size, int *ret)
+static inline AVBufferRef *vp_export_alloc_buffer(const VPExportFiles *files, int32_t id,
+                                                  int qp_w, int qp_h,
+                                                  int mv_w, int mv_h,
+                                                  int bits_w, int bits_h,
+                                                  int bits_block_size, int *ret)
 {
-    AVFrameSideData *sd;
+    AVBufferRef *buf;
     VPExportHeader *h;
     size_t size = sizeof(*h), qp_offset, mv_offset, bits_offset;
 
@@ -134,14 +134,12 @@ static inline VPExportHeader *vp_export_alloc(AVFrame *f, const VPExportFiles *f
     bits_offset = size;
     size       += (size_t)bits_w * bits_h * sizeof(VPExportBits);
 
-    av_frame_remove_side_data(f, AV_FRAME_DATA_VIDEOPARSER_BLOCKS);
-    sd = av_frame_new_side_data(f, AV_FRAME_DATA_VIDEOPARSER_BLOCKS, size);
-    if (!sd) {
+    buf = av_buffer_allocz(size);
+    if (!buf) {
         *ret = AVERROR(ENOMEM);
         return NULL;
     }
-    memset(sd->data, 0, size);
-    h = (VPExportHeader *)sd->data;
+    h = (VPExportHeader *)buf->data;
     h->id = id;
     h->qp_w = qp_w;
     h->qp_h = qp_h;
@@ -155,7 +153,33 @@ static inline VPExportHeader *vp_export_alloc(AVFrame *f, const VPExportFiles *f
     h->bits_offset = bits_offset;
     for (int i = 0; i < mv_w * mv_h; i++)
         vp_export_mv_none(&vp_export_mv(h)[i]);
-    return h;
+    return buf;
+}
+
+/**
+ * Attach a zeroed export buffer to the frame, see vp_export_alloc_buffer().
+ */
+static inline VPExportHeader *vp_export_alloc(AVFrame *f, const VPExportFiles *files,
+                                              int32_t id,
+                                              int qp_w, int qp_h,
+                                              int mv_w, int mv_h,
+                                              int bits_w, int bits_h,
+                                              int bits_block_size, int *ret)
+{
+    AVBufferRef *buf = vp_export_alloc_buffer(files, id, qp_w, qp_h, mv_w, mv_h,
+                                              bits_w, bits_h, bits_block_size, ret);
+    AVFrameSideData *sd;
+
+    if (!buf)
+        return NULL;
+    av_frame_remove_side_data(f, AV_FRAME_DATA_VIDEOPARSER_BLOCKS);
+    sd = av_frame_new_side_data_from_buf(f, AV_FRAME_DATA_VIDEOPARSER_BLOCKS, buf);
+    if (!sd) {
+        av_buffer_unref(&buf);
+        *ret = AVERROR(ENOMEM);
+        return NULL;
+    }
+    return (VPExportHeader *)sd->data;
 }
 
 static inline VPExportHeader *vp_export_get(const AVFrame *f)
@@ -174,14 +198,13 @@ static inline int vp_export_write_record(FILE *file, const int32_t *header, int 
 }
 
 /**
- * Write the exports of an output frame. A frame without export data (for
- * example after a decoding error) gives an empty record, so that the records
- * stay aligned with the output frames.
+ * Write the exports of an output frame. A frame without export data (h is
+ * NULL, for example after a decoding error) gives an empty record, so that the
+ * records stay aligned with the output frames.
  */
-static inline int vp_export_write(const VPExportFiles *files, const AVFrame *f)
+static inline int vp_export_write_header(const VPExportFiles *files, VPExportHeader *h)
 {
     VPExportHeader empty = { 0 };
-    VPExportHeader *h = vp_export_get(f);
     int ret;
 
     if (!h)
@@ -209,6 +232,14 @@ static inline int vp_export_write(const VPExportFiles *files, const AVFrame *f)
             return ret;
     }
     return 0;
+}
+
+/**
+ * Write the exports attached to an output frame.
+ */
+static inline int vp_export_write(const VPExportFiles *files, const AVFrame *f)
+{
+    return vp_export_write_header(files, vp_export_get(f));
 }
 
 /**
