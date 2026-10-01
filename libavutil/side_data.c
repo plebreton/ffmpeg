@@ -64,6 +64,7 @@ static const AVSideDataDescriptor sd_props[] = {
     [AV_FRAME_DATA_RAW_COLOR_PARAMS]            = { "RAW camera color parameters",                  AV_SIDE_DATA_PROP_GLOBAL | AV_SIDE_DATA_PROP_COLOR_DEPENDENT },
     [AV_FRAME_DATA_DOWNMIX_MATRIX]              = { "Downmix Matrix",                               AV_SIDE_DATA_PROP_CHANNEL_DEPENDENT },
     [AV_FRAME_DATA_VIDEOPARSER_INFO]            = { "Shared frame info from videoparser" },
+    [AV_FRAME_DATA_VIDEOPARSER_BLOCKS]          = { "Per-block exports from videoparser" },
 };
 
 const AVSideDataDescriptor *av_frame_side_data_desc(enum AVFrameSideDataType type)

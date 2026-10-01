@@ -312,6 +312,12 @@ enum AVFrameSideDataType {
      * Shared frame info by videoparser to be extracted later.
      */
     AV_FRAME_DATA_VIDEOPARSER_INFO,
+
+    /**
+     * Per-block QP, motion vector and bit exports by videoparser, see
+     * libavcodec/videoparser_export.h.
+     */
+    AV_FRAME_DATA_VIDEOPARSER_BLOCKS,
 };
 
 enum AVActiveFormatDescription {

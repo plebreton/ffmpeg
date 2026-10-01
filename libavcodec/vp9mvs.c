@@ -634,7 +634,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
         }
         if (mode == NEWMV) {
             enum MVJoint j;
+            unsigned vp_mv_start; // videoparser
             td->c->bit_count = 0; // videoparser: reset before MV decoding
+            vp_mv_start = vpx_rac_bits(td->c); // videoparser
             j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
                                                s->prob.p.mv_joint);
 
@@ -656,6 +658,7 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
             }
             // videoparser: accumulate motion bits
             sf->motion_bit_count += td->c->bit_count;
+            td->vp_motion_bits += vpx_rac_bits(td->c) - vp_mv_start;
 #if !VP_MV_POC_NORMALIZATION
             // In legacy mode, mv_coded_count is handled in mv_statistics_vp9()
             // with outlier rejection and weighted counting
@@ -686,7 +689,9 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
             }
             if (mode == NEWMV) {
                 enum MVJoint j;
+                unsigned vp_mv_start; // videoparser
                 td->c->bit_count = 0; // videoparser: reset before MV decoding
+                vp_mv_start = vpx_rac_bits(td->c); // videoparser
                 j = vp89_rac_get_tree(td->c, ff_vp9_mv_joint_tree,
                                                    s->prob.p.mv_joint);
 
@@ -708,6 +713,7 @@ void ff_vp9_fill_mv(VP9TileData *td, VP9mv *mv, int mode, int sb)
                 }
                 // videoparser: accumulate motion bits
                 sf->motion_bit_count += td->c->bit_count;
+                td->vp_motion_bits += vpx_rac_bits(td->c) - vp_mv_start;
 #if !VP_MV_POC_NORMALIZATION
                 // In legacy mode, mv_coded_count is handled in mv_statistics_vp9()
                 // with outlier rejection and weighted counting

@@ -46,6 +46,8 @@ int ff_vpx_init_range_decoder(VPXRangeCoder *c, const uint8_t *buf, int buf_size
     c->buffer = buf;
     c->end = buf + buf_size;
     c->end_reached = 0;
+    c->total_bit_count = 0; // videoparser
+    c->vp_mark = 0;         // videoparser
     if (buf_size < 1)
         return AVERROR_INVALIDDATA;
     c->code_word = bytestream_get_be24(&c->buffer);

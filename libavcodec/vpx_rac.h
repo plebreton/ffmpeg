@@ -41,6 +41,10 @@ typedef struct VPXRangeCoder {
     unsigned int code_word;
     int end_reached;
     int bit_count; /* videoparser: tracks bits consumed for motion/coef counting */
+    unsigned total_bit_count; /* videoparser: bits shifted out by renormalization,
+                                 for the per-block bits export */
+    unsigned vp_mark;         /* videoparser: vpx_rac_bits() at the end of the
+                                 last exported block */
 } VPXRangeCoder;
 
 extern const uint8_t ff_vpx_norm_shift[256];
@@ -65,12 +69,23 @@ static av_always_inline unsigned int vpx_rac_renorm(VPXRangeCoder *c)
     c->high   <<= shift;
     code_word <<= shift;
     bits       += shift;
+    c->total_bit_count += shift; // videoparser
     if(bits >= 0 && c->buffer < c->end) {
         code_word |= bytestream_get_be16(&c->buffer) << bits;
         bits -= 16;
     }
     c->bits = bits;
     return code_word;
+}
+
+/**
+ * videoparser: number of bits consumed by the bools decoded so far. The
+ * decoder renormalizes before the next bool, so the pending shift of the last
+ * bool is added.
+ */
+static av_always_inline unsigned vpx_rac_bits(const VPXRangeCoder *c)
+{
+    return c->total_bit_count + ff_vpx_norm_shift[c->high];
 }
 
 #if   ARCH_ARM

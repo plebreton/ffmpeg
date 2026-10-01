@@ -40,6 +40,7 @@
 #include "vp9shared.h"
 #include "vpx_rac.h"
 #include "cbs_vp9.h"
+#include "videoparser_export.h"
 
 #define REF_INVALID_SCALE 0xFFFF
 
@@ -82,23 +83,6 @@ typedef struct VP9Filter {
     uint8_t /* bit=col */ mask[2 /* 0=y, 1=uv */][2 /* 0=col, 1=row */]
                               [8 /* rows */][4 /* 0=16, 1=8, 2=4, 3=inner4 */];
 } VP9Filter;
-
-typedef struct MVCellOut {
-    int16_t mv_l0_x;
-    int16_t mv_l0_y;
-    int16_t mv_l1_x;
-    int16_t mv_l1_y;
-    int8_t  ref_idx_l0;
-    int8_t  ref_idx_l1;
-    int8_t  pred_flag;
-    int8_t  reserved;
-} MVCellOut;
-
-typedef struct VP9BitsCell {
-    uint32_t total_bits;
-    uint32_t motion_bits;
-    uint32_t coeff_bits;
-} VP9BitsCell;
 
 typedef struct VP9Block {
     uint8_t seg_id, intra, comp, ref[2], mode[4], uvmode, skip;
@@ -195,39 +179,21 @@ typedef struct VP9Context {
     SharedFrameInfo vp_hidden_frame_stats;
     int vp_hidden_frame_distance;
     int vp_hidden_stats_valid;  ///< Whether vp_hidden_frame_stats has valid data
-    // add export of QP, MV, and bits maps
+
+    // videoparser: per-block QP, MV and bits exports
     char *qp_export_path;
-    FILE *qp_export_file;
-    int16_t *qp_y_tab;
-    int qp_tab_w;
-    int qp_tab_h;
-    int64_t qp_export_frame_counter;
-
     char *mv_export_path;
-    FILE *mv_export_file;
-    MVCellOut *mv_tab;
-    int mv_tab_w;
-    int mv_tab_h;
-    int64_t mv_export_frame_counter;
-
     char *block_bits_export_path;
-    FILE *block_bits_export_file;
-    uint32_t *block_total_bits;
-    uint32_t *block_motion_bits;
-    uint32_t *block_coeff_bits;
-    int block_bits_tab_w;
-    int block_bits_tab_h;
-    int64_t block_bits_export_frame_counter;
-
+    VPExportFiles vp_export_files;
+    VPExportHeader *vp_export;  ///< export data of the frame being decoded, or NULL
+    int32_t vp_export_counter;  ///< number of output frames written
 } VP9Context;
-
-
-
 
 struct VP9TileData {
     const VP9Context *s;
     VPXRangeCoder *c_b;
     VPXRangeCoder *c;
+    unsigned vp_motion_bits; ///< videoparser: bits of the MVDs of the current block
     int row, row7, col, col7;
     uint8_t *dst[3];
     ptrdiff_t y_stride, uv_stride;

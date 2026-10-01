@@ -961,6 +961,7 @@ static int cabac_bypass_bits(CABACContext *c, int n)
         c->low = x % r;
         c->bytestream = bytestream;
         c->bit_count += n; // videoparser
+        c->total_bit_count += n; // videoparser
         return x / r;
     } else {
         int ret = 0;
@@ -998,10 +999,12 @@ static int cabac_unary_prefix(CABACContext *c, int max)
 
             c->low = (x >> k) - ((uint64_t)(q >> k) * r);
             c->bit_count += p + 1; // videoparser
+            c->total_bit_count += p + 1; // videoparser
             return prefix + p;
         }
         c->low = x - (uint64_t)q * r;
         c->bit_count += n; // videoparser
+        c->total_bit_count += n; // videoparser
         prefix += n;
     }
     return prefix;

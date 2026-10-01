@@ -330,77 +330,6 @@ static int update_size(AVCodecContext *avctx, int w, int h)
     s->rows      = (h + 7) >> 3;
     lflvl_len    = avctx->active_thread_type == FF_THREAD_SLICE ? s->sb_rows : 1;
 
-    /* allocate QP export buffer (8x8 grid) */
-    if (s->qp_export_path) {
-        const int sz = cols * rows;
-
-        if (s->qp_tab_w != cols || s->qp_tab_h != rows) {
-            av_freep(&s->qp_y_tab);
-
-            s->qp_y_tab = av_malloc_array(sz, sizeof(int16_t));
-            if (!s->qp_y_tab)
-                return AVERROR(ENOMEM);
-
-            s->qp_tab_w = cols;
-            s->qp_tab_h = rows;
-        }
-
-        memset(s->qp_y_tab, 0, sz * sizeof(int16_t));
-    }
-
-    /* allocate MV export buffer on the same block grid as QP */
-    if (s->mv_export_path) {
-        const int sz = cols * rows;
-
-        if (s->mv_tab_w != cols || s->mv_tab_h != rows) {
-            av_freep(&s->mv_tab);
-
-            s->mv_tab = av_malloc_array(sz, sizeof(*s->mv_tab));
-            if (!s->mv_tab)
-                return AVERROR(ENOMEM);
-
-            s->mv_tab_w = cols;
-            s->mv_tab_h = rows;
-        }
-
-        for (int i = 0; i < sz; i++) {
-            s->mv_tab[i].mv_l0_x = -32768;
-            s->mv_tab[i].mv_l0_y = -32768;
-            s->mv_tab[i].mv_l1_x = -32768;
-            s->mv_tab[i].mv_l1_y = -32768;
-            s->mv_tab[i].ref_idx_l0 = -1;
-            s->mv_tab[i].ref_idx_l1 = -1;
-            s->mv_tab[i].pred_flag  = 0;
-            s->mv_tab[i].reserved   = 0;
-        }
-    }
-
-    /* allocate bits usage export buffer on the same block grid as QP */
-    if (s->block_bits_export_path) {
-        const int sz = cols * rows;
-
-        if (s->block_bits_tab_w != cols || s->block_bits_tab_h != rows) {
-            av_freep(&s->block_total_bits);
-            av_freep(&s->block_motion_bits);
-            av_freep(&s->block_coeff_bits);
-
-            s->block_total_bits  = av_mallocz(sz * sizeof(*s->block_total_bits));
-            s->block_motion_bits = av_mallocz(sz * sizeof(*s->block_motion_bits));
-            s->block_coeff_bits  = av_mallocz(sz * sizeof(*s->block_coeff_bits));
-            if (!s->block_total_bits || !s->block_motion_bits || !s->block_coeff_bits)
-                return AVERROR(ENOMEM);
-
-            s->block_bits_tab_w = cols;
-            s->block_bits_tab_h = rows;
-        } else {
-            memset(s->block_total_bits,  0, sz * sizeof(*s->block_total_bits));
-            memset(s->block_motion_bits, 0, sz * sizeof(*s->block_motion_bits));
-            memset(s->block_coeff_bits,  0, sz * sizeof(*s->block_coeff_bits));
-        }
-    }
-
-
-
 #define assign(var, type, n) var = (type) p; p += s->sb_cols * (n) * sizeof(*var)
     av_freep(&s->intra_pred_data[0]);
     // FIXME we slightly over-allocate here for subsampled chroma, but a little
@@ -442,119 +371,6 @@ static int update_size(AVCodecContext *avctx, int w, int h)
 
     return changed;
 }
-
-
-static int export_qp_matrix_vp9(VP9Context *s)
-{
-
-    const int w = s->qp_tab_w;
-    const int h = s->qp_tab_h;
-
-    if (!s->qp_export_file || !s->qp_y_tab)
-        return 0;
-
-    int32_t header[3];
-    header[0] = s->qp_export_frame_counter++;
-    header[1] = w;
-    header[2] = h;
-
-    if (fwrite(header, sizeof(header[0]), 3, s->qp_export_file) != 3)
-        return AVERROR(EIO);
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int16_t v = s->qp_y_tab[y * w + x];
-            if (fwrite(&v, sizeof(v), 1, s->qp_export_file) != 1)
-                return AVERROR(EIO);
-        }
-    }
-
-    return 0;
-}
-
-
-
-static int export_mv_matrix_vp9(VP9Context *s)
-{
-    const int w = s->mv_tab_w;
-    const int h = s->mv_tab_h;
-
-    if (!s->mv_export_file || !s->mv_tab)
-        return 0;
-
-    int32_t header[3];
-    header[0] = s->mv_export_frame_counter++;
-    header[1] = w;
-    header[2] = h;
-
-    if (fwrite(header, sizeof(header[0]), 3, s->mv_export_file) != 3)
-        return AVERROR(EIO);
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            const MVCellOut *v = &s->mv_tab[y * w + x];
-            if (fwrite(v, sizeof(*v), 1, s->mv_export_file) != 1)
-                return AVERROR(EIO);
-        }
-    }
-
-    return 0;
-}
-
-static int export_block_bits_matrix_vp9(VP9Context *s)
-{
-    const int w = s->block_bits_tab_w;
-    const int h = s->block_bits_tab_h;
-
-    if (!s->block_bits_export_file || !s->block_total_bits ||
-        !s->block_motion_bits || !s->block_coeff_bits)
-        return 0;
-
-    int32_t header[4];
-    header[0] = s->block_bits_export_frame_counter++;
-    header[1] = w;
-    header[2] = h;
-    header[3] = 8;
-
-    if (fwrite(header, sizeof(header[0]), 4, s->block_bits_export_file) != 4)
-        return AVERROR(EIO);
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            const int idx = y * w + x;
-            VP9BitsCell out;
-
-            out.total_bits  = s->block_total_bits[idx];
-            out.motion_bits = s->block_motion_bits[idx];
-            out.coeff_bits  = s->block_coeff_bits[idx];
-
-            if (fwrite(&out, sizeof(out), 1, s->block_bits_export_file) != 1)
-                return AVERROR(EIO);
-        }
-    }
-
-    return 0;
-}
-
-
-
-#define OFFSET(x) offsetof(VP9Context, x)
-#define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
-
-static const AVOption vp9_options[] = {
-    { "export_qp_matrix", "Write per-frame VP9 QP matrices to a binary file", OFFSET(qp_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
-    { "export_mv_matrix", "Write per-frame VP9 motion-vector matrix to a binary file", OFFSET(mv_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
-    { "export_ctu_bits_matrix", "Write per-frame VP9 block bit counts to a binary file", OFFSET(block_bits_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
-    { NULL }
-};
-
-
-static const AVClass vp9_class = {
-    .class_name = "vp9 decoder",
-    .item_name  = av_default_item_name,
-    .option     = vp9_options,
-    .version    = LIBAVUTIL_VERSION_INT,
-};
 
 static int update_block_buffers(AVCodecContext *avctx)
 {
@@ -1495,6 +1311,8 @@ static av_cold int vp9_decode_free(AVCodecContext *avctx)
     VP9Context *s = avctx->priv_data;
     int i;
 
+    vp_export_close(&s->vp_export_files); // videoparser
+
     for (int i = 0; i < 3; i++)
         vp9_frame_unref(&s->s.frames[i]);
     av_refstruct_pool_uninit(&s->frame_extradata_pool);
@@ -1513,35 +1331,6 @@ static av_cold int vp9_decode_free(AVCodecContext *avctx)
     av_refstruct_unref(&s->header_ref);
     ff_cbs_fragment_free(&s->current_frag);
     ff_cbs_close(&s->cbc);
-
-    if (s->qp_export_file) {
-        fclose(s->qp_export_file);
-        s->qp_export_file = NULL;
-
-        av_freep(&s->qp_y_tab);
-        s->qp_tab_w = 0;
-        s->qp_tab_h = 0;
-    }
-
-    av_freep(&s->mv_tab);
-    s->mv_tab_w = 0;
-    s->mv_tab_h = 0;
-
-    if (s->mv_export_file) {
-        fclose(s->mv_export_file);
-        s->mv_export_file = NULL;
-    }
-
-    av_freep(&s->block_total_bits);
-    av_freep(&s->block_motion_bits);
-    av_freep(&s->block_coeff_bits);
-    s->block_bits_tab_w = 0;
-    s->block_bits_tab_h = 0;
-
-    if (s->block_bits_export_file) {
-        fclose(s->block_bits_export_file);
-        s->block_bits_export_file = NULL;
-    }
 
     av_freep(&s->td);
     return 0;
@@ -1856,6 +1645,22 @@ static void vp9_warn_unsupported_webm_alpha(AVCodecContext *avctx,
                 "libvpx-vp9 decoder to decode it.\n");
 }
 
+/**
+ * videoparser: write the exports of an output frame, numbered in output order
+ */
+static int vp9_export_write(VP9Context *s, AVFrame *frame)
+{
+    VPExportHeader *h = vp_export_get(frame);
+    int ret;
+
+    if (h)
+        h->id = s->vp_export_counter;
+    s->vp_export_counter++;
+    ret = vp_export_write(&s->vp_export_files, frame);
+    av_frame_remove_side_data(frame, AV_FRAME_DATA_VIDEOPARSER_BLOCKS);
+    return ret;
+}
+
 static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame, AVPacket *pkt)
 {
@@ -1901,12 +1706,15 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         ff_progress_frame_await(&s->s.refs[ref], INT_MAX);
         ff_cbs_fragment_reset(&s->current_frag);
 
-        if ((ret = av_frame_ref(frame, s->s.refs[ref].f)) < 0) 
+        if ((ret = av_frame_ref(frame, s->s.refs[ref].f)) < 0)
             return ret;
-
         frame->pts     = pkt->pts;
         frame->pkt_dts = pkt->dts;
         *got_frame = 1;
+
+        // videoparser: the exports of the frame that is shown again
+        if ((ret = vp9_export_write(s, frame)) < 0)
+            return ret;
 
 #if VP_MV_POC_NORMALIZATION
         // videoparser: Handle show_existing_frame (short frame) in legacy mode
@@ -1947,6 +1755,16 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     vp9_frame_replace(&s->s.frames[REF_FRAME_MVPAIR], src);
     vp9_frame_unref(&s->s.frames[CUR_FRAME]);
     if ((ret = vp9_frame_alloc(avctx, &s->s.frames[CUR_FRAME])) < 0) {
+        ff_cbs_fragment_reset(&s->current_frag);
+        return ret;
+    }
+
+    // videoparser: export data on the 8x8 block grid, which travels with the
+    // frame, also when show_existing_frame shows it later
+    s->vp_export = vp_export_alloc(s->s.frames[CUR_FRAME].tf.f, &s->vp_export_files, 0,
+                                   s->cols, s->rows, s->cols, s->rows,
+                                   s->cols, s->rows, 8, &ret);
+    if (ret < 0) {
         ff_cbs_fragment_reset(&s->current_frag);
         return ret;
     }
@@ -2131,24 +1949,13 @@ finish:
     if (!s->s.h.invisible) {
         if ((ret = av_frame_ref(frame, s->s.frames[CUR_FRAME].tf.f)) < 0)
             return ret;
-
-        // Export QP matrix for visible frames
-        ret = export_qp_matrix_vp9(s);
-        if (ret < 0)
-            return ret;
-
-        // Export MV matrix for visible frames
-        ret = export_mv_matrix_vp9(s);
-        if (ret < 0)
-            return ret;
-
-        // export bits
-        ret = export_block_bits_matrix_vp9(s);
-        if (ret < 0)
-            return ret;
-
         *got_frame = 1;
+
+        // videoparser
+        if ((ret = vp9_export_write(s, frame)) < 0)
+            return ret;
     }
+    s->vp_export = NULL; // videoparser
 
 #if VP_MV_POC_NORMALIZATION
     // videoparser: Handle hidden frame accumulation (legacy mode)
@@ -2235,26 +2042,11 @@ static av_cold int vp9_decode_init(AVCodecContext *avctx)
     }
 #endif
 
-    if (s->qp_export_path) {
-        s->qp_export_file = fopen(s->qp_export_path, "wb");
-        if (!s->qp_export_file)
-            return AVERROR(errno);
-        s->qp_export_frame_counter = 0;
-    }
-
-    if (s->mv_export_path) {
-        s->mv_export_file = fopen(s->mv_export_path, "wb");
-        if (!s->mv_export_file)
-            return AVERROR(errno);
-        s->mv_export_frame_counter = 0;
-    }
-
-    if (s->block_bits_export_path) {
-        s->block_bits_export_file = fopen(s->block_bits_export_path, "wb");
-        if (!s->block_bits_export_file)
-            return AVERROR(errno);
-        s->block_bits_export_frame_counter = 0;
-    }
+    // videoparser
+    ret = vp_export_open(&s->vp_export_files, s->qp_export_path,
+                         s->mv_export_path, s->block_bits_export_path);
+    if (ret < 0)
+        return ret;
 
     return 0;
 }
@@ -2303,6 +2095,22 @@ static int vp9_decode_update_thread_context(AVCodecContext *dst, const AVCodecCo
 }
 #endif
 
+// videoparser: options for the per-block exports
+#define OFFSET(x) offsetof(VP9Context, x)
+#define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+static const AVOption vp9_options[] = {
+    { "export_qp_matrix", "Write per-frame VP9 QP matrices to a binary file", OFFSET(qp_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_mv_matrix", "Write per-frame VP9 motion-vector matrix to a binary file", OFFSET(mv_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { "export_ctu_bits_matrix", "Write per-frame VP9 block bit counts to a binary file", OFFSET(block_bits_export_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
+    { NULL }
+};
+
+static const AVClass vp9_class = {
+    .class_name = "vp9 decoder",
+    .item_name  = av_default_item_name,
+    .option     = vp9_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
 
 const FFCodec ff_vp9_decoder = {
     .p.name                = "vp9",
@@ -2310,6 +2118,7 @@ const FFCodec ff_vp9_decoder = {
     .p.type                = AVMEDIA_TYPE_VIDEO,
     .p.id                  = AV_CODEC_ID_VP9,
     .priv_data_size        = sizeof(VP9Context),
+    .p.priv_class          = &vp9_class,
     .init                  = vp9_decode_init,
     .close                 = vp9_decode_free,
     FF_CODEC_DECODE_CB(vp9_decode_frame),
@@ -2354,5 +2163,4 @@ const FFCodec ff_vp9_decoder = {
 #endif
                                NULL
                            },
-    .p.priv_class = &vp9_class,
 };
